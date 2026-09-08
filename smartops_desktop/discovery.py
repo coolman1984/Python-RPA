@@ -107,7 +107,7 @@ def discover_native(screen_x, screen_y):
 
 
 def discover_cdp_accessibility(page, selector, is_main_frame=True):
-    """Read Chrome's accessibility tree for the selected DOM target when possible."""
+    """Read Chrome's accessibility identity without storing field values."""
     if not selector:
         return _layer("miss", reason="The recorded action has no DOM selector.")
     if not is_main_frame:
@@ -127,12 +127,10 @@ def discover_cdp_accessibility(page, selector, is_main_frame=True):
             role = (node.get("role") or {}).get("value", "")
             name = (node.get("name") or {}).get("value", "")
             description = (node.get("description") or {}).get("value", "")
-            value = (node.get("value") or {}).get("value", "")
             nodes.append({
                 "role": _text(role, 100),
                 "name": _text(name),
                 "description": _text(description),
-                "value": _text(value),
                 "ignored": bool(node.get("ignored", False)),
             })
         return _layer("ok", target=nodes[0] if nodes else {}, nodes=nodes)
@@ -182,8 +180,12 @@ def enrich_recorded_step(page, frame, step, run_dir, index):
     layers = dict(discovery.get("layers") or {})
     layers.update(discover_native(point.get("screen_x"), point.get("screen_y")))
     layers["browser_accessibility"] = discover_cdp_accessibility(page, step.get("selector"), frame == page.main_frame)
-    if step.get("action") in {"click", "fill", "select", "check", "press"}:
+    # Do not screenshot filled fields after the user typed into them. The workflow may
+    # intentionally keep the fill value, but discovery evidence should not duplicate it.
+    if step.get("action") in {"click", "select", "check", "press"}:
         layers["visual"] = capture_visual(page, discovery.get("geometry") or {}, run_dir, index)
+    elif step.get("action") == "fill":
+        layers["visual"] = _layer("skipped_privacy", reason="Visual capture is disabled for filled fields.")
     else:
         layers["visual"] = _layer("not_applicable")
     discovery["layers"] = layers
