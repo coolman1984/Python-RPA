@@ -71,6 +71,8 @@ def validate_workflow(raw):
     for index, step in enumerate(raw["steps"], 1):
         if not isinstance(step, dict) or step.get("action") not in ACTIONS:
             raise ValueError(f"Step {index}: unsupported action.")
+        # dict(step) keeps every key the recorder attached: fingerprint, detected_by, capture
+        # metadata. Rebuilding a step from known fields only is how that evidence gets lost.
         item = dict(step)
         action = item["action"]
         if action == "navigate":
