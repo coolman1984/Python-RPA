@@ -19,7 +19,12 @@ pytestmark = pytest.mark.skipif(not ENDPOINT, reason="Set SMARTOPS_TEST_CDP to a
 
 PLAIN = """<h2>Daily production</h2>
 <form><label for="qty">Quantity produced</label><input id="qty" name="quantity" type="text">
-<button id="save" type="button" onclick="document.title='PAGE REACTED'">Save report</button></form>"""
+<button id="save" type="button" onclick="document.title='PAGE REACTED'">Save report</button>
+<input id="secret" type="password" name="password" value="hunter2">
+<a id="popout" href="https://example.org/report" target="_blank">Open report</a></form>"""
+
+IFRAME = """<h2>Outer page</h2><iframe id="reportFrame" name="report" style="width:400px;height:200px"
+ srcdoc="&lt;label for='inner'&gt;Line code&lt;/label&gt;&lt;input id='inner' name='line'&gt;"></iframe>"""
 
 NEXACRO = """<h2>G-MES Daily Report</h2>
 <div id="mainframe.WorkFrame.form.divWork.form">
@@ -42,11 +47,17 @@ def radar(tmp_path):
         page.set_viewport_size({"width": 1000, "height": 700})
 
         def point_at(html, *selectors):
+            """A selector may be "#id" or "frame#id >>> #id" to point inside an iframe."""
             page.set_content(html)
+            page.wait_for_timeout(250)  # let any iframe finish loading before the probe goes in
             output, pending = queue.Queue(), []
             arm_radar(page, pending)
             for selector in selectors:
-                page.click(selector, timeout=5000)
+                if " >>> " in selector:
+                    holder, inner = selector.split(" >>> ", 1)
+                    page.frame_locator(holder).locator(inner).click(timeout=5000)
+                else:
+                    page.click(selector, timeout=5000)
                 page.wait_for_timeout(250)
             drain_radar(page, tmp_path, pending, output, 0)
             disarm_radar(page)
@@ -65,12 +76,66 @@ def test_pointing_at_a_field_reports_several_independent_layers(radar):
     _page, found = radar(PLAIN, "#qty")
     assert len(found) == 1
     status = layers_of(found[0])
-    assert status["web"] == status["accessibility"] == status["anchor"] == fp.FOUND
-    assert status["image"] == status["relative"] == status["keyboard"] == fp.FOUND
+    assert status["web"] == status["frame"] == status["accessibility"] == status["anchor"] == fp.FOUND
+    assert status["visual"] == status["relative"] == status["keyboard"] == fp.FOUND
     assert found[0]["layers"]["accessibility"]["data"]["role"] == "textbox"
     assert found[0]["layers"]["accessibility"]["data"]["name"] == "Quantity produced"
     assert found[0]["layers"]["anchor"]["data"]["text"] == "Quantity produced"
+    assert found[0]["layers"]["anchor"]["data"]["bound"] is True
     assert fp.score(found[0])["confident"]
+
+
+def test_no_detector_fails_on_a_real_page(radar):
+    _page, found = radar(PLAIN, "#qty")
+    failed = [key for key, entry in found[0]["layers"].items() if entry["status"] == fp.FAILED]
+    assert failed == []
+
+
+def test_confidence_ranks_the_layers_on_a_real_page(radar):
+    _page, found = radar(PLAIN, "#save")
+    ordered = fp.rank(found[0])
+    assert [key for key, _ in ordered][:2] == ["web", "accessibility"]
+    assert dict(ordered)["web"]["confidence"] == 0.95
+    assert all(a[1]["confidence"] >= b[1]["confidence"] for a, b in zip(ordered, ordered[1:]))
+
+
+def test_frame_context_is_recorded_but_never_ranked_as_a_way_to_find_the_element(radar):
+    _page, found = radar(PLAIN, "#save")
+    assert found[0]["layers"]["frame"]["status"] == fp.FOUND
+    assert "frame" not in [key for key, _ in fp.rank(found[0])]
+    summary = fp.score(found[0])
+    assert summary["best"] == "web"
+    assert "frame" in summary["context"]
+
+
+def test_the_accessibility_tree_is_read_inside_an_iframe_too(radar):
+    _page, found = radar(IFRAME, "#reportFrame >>> #inner")
+    accessibility = found[0]["layers"]["accessibility"]
+    assert accessibility["status"] == fp.FOUND
+    assert accessibility["data"]["role"] == "textbox" and accessibility["data"]["name"] == "Line code"
+
+
+def test_an_element_inside_an_iframe_reports_its_frame_chain(radar):
+    _page, found = radar(IFRAME, "#reportFrame >>> #inner")
+    frame = found[0]["layers"]["frame"]
+    assert frame["status"] == fp.FOUND
+    assert frame["data"]["top_level"] is False and frame["data"]["depth"] == 1
+    assert frame["data"]["chain"][-1]["id"] == "reportFrame"
+    assert frame["confidence"] == 0.85
+    assert found[0]["layers"]["web"]["data"]["in_iframe"] is True
+
+
+def test_a_link_that_opens_a_new_tab_is_marked_as_such(radar):
+    _page, found = radar(PLAIN, "#popout")
+    assert found[0]["layers"]["frame"]["data"]["opens_new_tab"] is True
+
+
+def test_a_password_field_is_identified_but_its_content_is_never_captured(radar):
+    _page, found = radar(PLAIN, "#secret")
+    web = found[0]["layers"]["web"]
+    assert web["status"] == fp.FOUND and web["data"]["sensitive"] is True
+    assert "value" not in web["data"]
+    assert "hunter2" not in repr(found[0])
 
 
 def test_layers_not_built_yet_are_reported_as_unavailable_not_failed(radar):
@@ -105,7 +170,7 @@ def test_a_picture_and_a_json_fingerprint_are_kept_for_every_element(radar, tmp_
     _page, found = radar(PLAIN, "#qty", "#save")
     assert len(found) == 2
     for index, fingerprint in enumerate(found, 1):
-        image = fingerprint["layers"]["image"]["data"]
+        image = fingerprint["layers"]["visual"]["data"]
         assert (tmp_path / f"element-{index}.json").is_file()
         assert os.path.isfile(image["element_png"]) and os.path.isfile(image["context_png"])
 

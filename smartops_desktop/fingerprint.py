@@ -1,43 +1,65 @@
-"""Multi-layer element identity: how many independent ways can one element be recognised?
+"""The ElementFingerprint contract: one element, many independent ways of recognising it.
 
-Every layer answers the same question — "do I see this element, and by what?" — and writes
-its answer into one shared shape. The radar card, the stored fingerprint and any future
-replayer all read that shape, so a new layer is added without touching the others.
+This module is pure data. It defines the eleven discovery layers, the vocabulary every
+detector must speak, and the merge/ranking rules. It never touches a browser, a screen,
+the GUI or the filesystem, so every rule here is testable without any of them.
 
-No browser, GUI or filesystem side effects on import. Layers are captured elsewhere
-(probe.js in the page, worker.py over CDP, later a Windows or vision capturer) and normalised
-here before anything else is allowed to read them.
+Two different judgements are kept apart on purpose:
+
+  status    what happened to THIS observation of THIS element  (found / missing / unavailable / failed)
+  maturity  how far the detector itself has been proven        (verified / implemented_unverified / not_implemented)
+
+A detector whose code exists but has never run against the real thing reports
+IMPLEMENTED_UNVERIFIED forever, however many times it returns FOUND. Confidence never
+launders an unproven detector into a trusted one.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-FOUND = "found"            # the layer identified the element
-MISSING = "missing"        # the layer ran and could not identify it
-UNAVAILABLE = "unavailable"  # the layer could not run here at all
-STATUSES = (FOUND, MISSING, UNAVAILABLE)
-ICONS = {FOUND: "✅", MISSING: "❌", UNAVAILABLE: "⚪"}
+# --- what happened to this observation --------------------------------------------------
+FOUND = "found"              # the detector identified the element
+MISSING = "missing"          # the detector ran and could not identify it
+UNAVAILABLE = "unavailable"  # the detector could not run here (wrong platform, engine absent)
+FAILED = "failed"            # the detector raised; recording continued without it
+STATUSES = (FOUND, MISSING, UNAVAILABLE, FAILED)
+ICONS = {FOUND: "✅", MISSING: "❌", UNAVAILABLE: "⚪", FAILED: "⚠️"}
 
-# Capture order, most specific first. The replayer will later prefer the earliest FOUND layer.
+# --- how far the detector itself has been proven ----------------------------------------
+VERIFIED = "VERIFIED"                              # exercised against the real thing
+IMPLEMENTED_UNVERIFIED = "IMPLEMENTED_UNVERIFIED"  # code exists, never met the real thing
+NOT_IMPLEMENTED = "NOT_IMPLEMENTED"                # no detection logic at all
+MATURITIES = (VERIFIED, IMPLEMENTED_UNVERIFIED, NOT_IMPLEMENTED)
+
+# key, short name, title, what it answers, maturity claimed by this release
 LAYERS = (
-    ("web", "Web element", "Tag, id, name, text and selector of an ordinary page element."),
-    ("nexacro", "Nexacro component", "The real component: type, name, its form, grid, row, column and parent."),
-    ("accessibility", "Accessibility tree", "What the system exposes: is this a button, a field, a list?"),
-    ("windows", "Windows control", "Desktop windows, menus, dialogs and system buttons."),
-    ("anchor", "Anchor", "A stable neighbour, so a moved or renamed element is still findable."),
-    ("image", "Image", "A picture of the element and of the area around it."),
-    ("ocr", "Screen text", "Text read off the screen, used as a clue to the location."),
-    ("relative", "Relative position", "Placement inside its window or anchor, never the whole screen."),
-    ("keyboard", "Keyboard route", "Focus order and shortcuts, as a fallback path."),
-    ("vision", "Computer vision", "Last resort, for what every other layer missed."),
+    ("web", "Web", "Web element", "Tag, id, name, text and selector of an ordinary page element.", VERIFIED),
+    ("frame", "Frame", "Frame and tab context", "Which frame, which iframe chain, and whether the target opens a new tab.", VERIFIED),
+    ("nexacro", "Nexacro", "Nexacro component", "Component type, name, path, its form, grid, row, column and parent.", IMPLEMENTED_UNVERIFIED),
+    ("accessibility", "Accessibility", "Accessibility tree", "The role and accessible name the system publishes.", VERIFIED),
+    ("windows", "Windows UIA", "Windows UI Automation", "Desktop windows, menus, dialogs and system controls.", IMPLEMENTED_UNVERIFIED),
+    ("anchor", "Anchor", "Anchor", "A stable neighbour, so a moved or renamed element is still findable.", VERIFIED),
+    ("visual", "Visual", "Visual fingerprint", "A picture of the element and of the area around it.", VERIFIED),
+    ("relative", "Relative", "Relative position", "Placement inside its own container, never the whole screen.", VERIFIED),
+    ("keyboard", "Keyboard", "Keyboard route", "Focus order and shortcuts, as a fallback path.", VERIFIED),
+    ("ocr", "OCR", "Screen text", "Text read off the screen, used as a clue to the location.", IMPLEMENTED_UNVERIFIED),
+    ("vision", "Vision", "Computer vision", "Last resort for what every other layer missed.", IMPLEMENTED_UNVERIFIED),
 )
-LAYER_KEYS = tuple(key for key, _title, _purpose in LAYERS)
-TITLES = {key: title for key, title, _purpose in LAYERS}
-PURPOSES = {key: purpose for key, _title, purpose in LAYERS}
+LAYER_KEYS = tuple(key for key, *_ in LAYERS)
+SHORT = {key: short for key, short, *_ in LAYERS}
+TITLES = {key: title for key, _short, title, *_ in LAYERS}
+PURPOSES = {key: purpose for key, _short, _title, purpose, _maturity in LAYERS}
+MATURITY = {key: maturity for key, _short, _title, _purpose, maturity in LAYERS}
+
+# Frame context says WHERE to look, not WHICH element. It is recorded and scored, but it never
+# competes to be the strongest way of identifying the element itself.
+CONTEXT_LAYERS = ("frame",)
+IDENTITY_KEYS = tuple(key for key in LAYER_KEYS if key not in CONTEXT_LAYERS)
 
 MAX_TEXT = 400
 MAX_ITEMS = 60
 MAX_DEPTH = 6
+CONFIDENT_LAYERS = 2  # one lucky selector is not evidence; two independent layers is a start
 
 
 def now():
@@ -61,25 +83,36 @@ def _clean(value, depth=0):
     return None
 
 
-def layer(status, detail="", **data):
-    return {"status": status if status in STATUSES else MISSING, "detail": str(detail)[:MAX_TEXT], "data": _clean(data) or {}}
+def confidence_of(value):
+    try:
+        return round(min(1.0, max(0.0, float(value))), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def observation(key, status, detail="", confidence=0.0, **data):
+    """One detector's answer about one element. Confidence only means anything when FOUND."""
+    status = status if status in STATUSES else MISSING
+    return {"status": status, "confidence": confidence_of(confidence) if status == FOUND else 0.0,
+            "detail": str(detail)[:MAX_TEXT], "maturity": MATURITY.get(key, NOT_IMPLEMENTED), "data": _clean(data) or {}}
 
 
 def blank(reason="Not captured."):
-    return {key: layer(UNAVAILABLE, reason) for key in LAYER_KEYS}
+    return {key: observation(key, UNAVAILABLE, reason) for key in LAYER_KEYS}
 
 
 def normalize(raw):
-    """Accept whatever the capturers produced and return a complete, bounded fingerprint."""
+    """Accept whatever the detectors produced and return a complete, bounded fingerprint."""
     raw = raw if isinstance(raw, dict) else {}
     incoming = raw.get("layers") if isinstance(raw.get("layers"), dict) else {}
-    layers = blank("This layer is not built yet.")
+    layers = blank("This detector did not run.")
     for key in LAYER_KEYS:
         value = incoming.get(key)
         if isinstance(value, dict) and value.get("status") in STATUSES:
-            layers[key] = layer(value["status"], value.get("detail", ""), **(value.get("data") if isinstance(value.get("data"), dict) else {}))
+            layers[key] = observation(key, value["status"], value.get("detail", ""), value.get("confidence", 0.0),
+                                      **(value.get("data") if isinstance(value.get("data"), dict) else {}))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "captured": str(raw.get("captured") or now())[:40],
         "source": str(raw.get("source") or "")[:MAX_TEXT],
         "page_title": str(raw.get("page_title") or "")[:MAX_TEXT],
@@ -87,17 +120,50 @@ def normalize(raw):
     }
 
 
+def rank(fingerprint):
+    """Identified layers, strongest evidence first. This is what a replayer would walk."""
+    layers = normalize(fingerprint)["layers"]
+    found = [(key, layers[key]) for key in IDENTITY_KEYS if layers[key]["status"] == FOUND]
+    # Ties break on capture order, which runs most specific first.
+    return sorted(found, key=lambda item: (-item[1]["confidence"], LAYER_KEYS.index(item[0])))
+
+
+def diagnostic(fingerprint):
+    """The per-target read-out: one line per layer, evidence strength or the reason there is none."""
+    layers = normalize(fingerprint)["layers"]
+    width = max(len(SHORT[key]) for key in LAYER_KEYS)
+    lines = []
+    for key in LAYER_KEYS:
+        entry = layers[key]
+        verdict = f"{entry['confidence']:.2f}" if entry["status"] == FOUND else entry["status"]
+        lines.append(f"{SHORT[key]:<{width}} {ICONS[entry['status']]} {verdict}")
+    return lines
+
+
 def radar(fingerprint):
     """One row per layer, in capture order, ready to render as the card."""
     layers = normalize(fingerprint)["layers"]
-    return [{"key": key, "title": TITLES[key], "purpose": PURPOSES[key], "icon": ICONS[layers[key]["status"]],
-             "status": layers[key]["status"], "detail": layers[key]["detail"]} for key in LAYER_KEYS]
+    return [{"key": key, "short": SHORT[key], "title": TITLES[key], "purpose": PURPOSES[key],
+             "icon": ICONS[layers[key]["status"]], "status": layers[key]["status"],
+             "confidence": layers[key]["confidence"], "maturity": layers[key]["maturity"],
+             "detail": layers[key]["detail"]} for key in LAYER_KEYS]
 
 
 def score(fingerprint):
-    """How many independent ways this element can be found, and whether that is enough to replay."""
+    """How many independent ways this element can be found, and how much to trust that."""
     layers = normalize(fingerprint)["layers"]
-    found = [key for key in LAYER_KEYS if layers[key]["status"] == FOUND]
-    missing = [key for key in LAYER_KEYS if layers[key]["status"] == MISSING]
-    return {"found": found, "missing": missing, "identified": len(found), "total": len(LAYER_KEYS),
-            "confident": len(found) >= 2, "headline": f"{len(found)} of {len(LAYER_KEYS)} layers identified this element."}
+    by_status = {status: [key for key in LAYER_KEYS if layers[key]["status"] == status] for status in STATUSES}
+    ordered = rank(fingerprint)
+    best = ordered[0] if ordered else None
+    # Only layers whose detector has met the real thing may support a confident verdict.
+    proven = [key for key, entry in ordered if entry["maturity"] == VERIFIED]
+    context = {key: layers[key]["detail"] for key in CONTEXT_LAYERS if layers[key]["status"] == FOUND}
+    return {
+        "found": by_status[FOUND], "missing": by_status[MISSING],
+        "unavailable": by_status[UNAVAILABLE], "failed": by_status[FAILED],
+        "identified": len(by_status[FOUND]), "total": len(LAYER_KEYS),
+        "best": best[0] if best else "", "best_confidence": best[1]["confidence"] if best else 0.0,
+        "proven": proven, "confident": len(proven) >= CONFIDENT_LAYERS, "context": context,
+        "headline": f"{len(by_status[FOUND])} of {len(LAYER_KEYS)} layers identified this element."
+                    + (f" Strongest: {SHORT[best[0]]} at {best[1]['confidence']:.2f}." if best else ""),
+    }

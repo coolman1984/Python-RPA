@@ -32,25 +32,51 @@
     return parts.join(' > ');
   };
 
+  // Credential fields are identified but never described by their content.
+  const sensitive = el => /password|passwd|secret|token|otp|credit|card/i.test([el.type, el.name, el.id, el.autocomplete].join(' '));
+  const unique = selector => { try { return document.querySelectorAll(selector).length === 1; } catch (error) { return null; } };
+
   // --- Layer: web ------------------------------------------------------------------------
   const webLayer = el => {
     const tag = el.tagName.toLowerCase();
+    const secret = sensitive(el);
     const data = {
       tag, id: el.id || '', name: el.name || '', type: attr(el, 'type'), role: attr(el, 'role'),
       testid: attr(el, 'data-testid'), title: attr(el, 'title'), placeholder: attr(el, 'placeholder'),
       classes: (el.className && typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 6) : []),
-      text: text(el), href: attr(el, 'href'), selector: cssPath(el),
-      in_iframe: window !== window.top, frame_url: window !== window.top ? location.href : '',
-      opens_new_tab: attr(el, 'target') === '_blank',
+      text: secret ? '' : text(el), href: attr(el, 'href'), selector: cssPath(el), sensitive: secret,
+      in_iframe: window !== window.top,
       kind: tag === 'a' ? 'link' : tag === 'select' ? 'list' : tag === 'textarea' ? 'field'
             : tag === 'button' ? 'button' : tag === 'iframe' ? 'inner frame'
             : tag === 'input' ? ((/^(button|submit|reset)$/i.test(attr(el, 'type')) ? 'button' : /^(checkbox|radio)$/i.test(attr(el, 'type')) ? 'choice' : 'field'))
             : attr(el, 'role') || 'text',
     };
-    const named = data.id || data.name || data.testid || data.text || data.title;
-    if (!named && !data.selector) return layer(MISSING, 'The element carries no id, name or text.', data);
-    const how = data.id ? 'id ' + data.id : data.name ? 'name ' + data.name : data.testid ? 'test id ' + data.testid : data.text ? '"' + data.text + '"' : data.selector;
-    return layer(FOUND, data.kind + ' · ' + how + (data.in_iframe ? ' · inside an inner frame' : ''), data);
+    data.unique_selector = data.selector ? unique(data.selector) : null;
+    data.unique_name = el.name ? document.querySelectorAll('[name="' + CSS.escape(el.name) + '"]').length === 1 : false;
+    if (!(data.id || data.name || data.testid || data.text || data.title) && !data.selector) {
+      return layer(MISSING, 'The element carries no id, name or text.', data);
+    }
+    return layer(FOUND, 'identified in the page', data);
+  };
+
+  // --- Layer: frame and tab context --------------------------------------------------------
+  const frameLayer = el => {
+    const chain = [];
+    let view = window, depth = 0;
+    while (view !== view.parent && depth < 8) {
+      let holder = null;
+      try { holder = view.frameElement; } catch (error) { holder = null; }
+      chain.unshift(holder
+        ? {id: holder.id || '', name: holder.getAttribute('name') || '', src: (holder.getAttribute('src') || '').slice(0, 200), selector: cssPath(holder)}
+        : {cross_origin: true});
+      view = view.parent;
+      depth++;
+    }
+    return layer(FOUND, 'frame context resolved', {
+      depth, top_level: depth === 0, url: location.href, frame_name: window.name || '', chain,
+      target: attr(el, 'target'),
+      opens_new_tab: attr(el, 'target') === '_blank' || (el.tagName === 'A' && /\bnoopener\b/.test(attr(el, 'rel'))),
+    });
   };
 
   // --- Layer: nexacro --------------------------------------------------------------------
@@ -134,15 +160,16 @@
       const rect = candidate.getBoundingClientRect();
       const distance = Math.hypot(rect.left + rect.width / 2 - centre.x, rect.top + rect.height / 2 - centre.y);
       // A <label for> that points straight at the element beats anything measured by distance.
-      const bound = candidate.tagName === 'LABEL' && (candidate.htmlFor === el.id && el.id) ? 0 : distance;
-      if (!best || bound < best.distance) best = {node: candidate, words, distance: bound, rect};
+      const bound = candidate.tagName === 'LABEL' && el.id && candidate.htmlFor === el.id;
+      const ranked = bound ? -1 : distance;
+      if (!best || ranked < best.ranked) best = {node: candidate, words, ranked, distance, bound, rect};
     }
     if (!best) return layer(MISSING, 'No stable neighbouring text was found.', {});
     const rect = best.rect;
     const side = rect.bottom <= target.top ? 'above' : rect.top >= target.bottom ? 'below' : rect.right <= target.left ? 'left of' : rect.left >= target.right ? 'right of' : 'overlapping';
-    return layer(FOUND, '"' + best.words + '" ' + side + ' the element', {
+    return layer(FOUND, 'anchor resolved', {
       text: best.words, tag: best.node.tagName.toLowerCase(), selector: cssPath(best.node),
-      side, distance: Math.round(best.distance), anchor_box: box(best.node),
+      side, bound: best.bound, distance: Math.round(best.distance), anchor_box: box(best.node),
     });
   };
 
@@ -175,17 +202,19 @@
   };
 
   let counter = 0;
-  const capture = el => {
+  const capture = (el, event) => {
     // Tag the element so the worker can resolve the very same node over CDP for the
     // accessibility tree, then hand the tag back for removal.
     const token = 'e' + (++counter) + '-' + Math.random().toString(36).slice(2, 10);
     try { el.setAttribute('data-smartops-probe', token); } catch (error) { /* read-only nodes */ }
     const layers = {};
-    for (const [key, build] of [['web', webLayer], ['nexacro', nexacroLayer], ['anchor', anchorLayer], ['relative', relativeLayer], ['keyboard', keyboardLayer]]) {
+    for (const [key, build] of [['web', webLayer], ['frame', frameLayer], ['nexacro', nexacroLayer], ['anchor', anchorLayer], ['relative', relativeLayer], ['keyboard', keyboardLayer]]) {
       try { layers[key] = build(el); }
       catch (error) { layers[key] = layer(MISSING, 'This layer failed: ' + (error && error.message ? error.message : error)); }
     }
-    return {source: location.href, page_title: document.title, layers, token, box: box(el), device_pixel_ratio: window.devicePixelRatio || 1};
+    return {source: location.href, page_title: document.title, layers, token, box: box(el),
+            screen: event ? {x: Math.round(event.screenX), y: Math.round(event.screenY)} : null,
+            device_pixel_ratio: window.devicePixelRatio || 1};
   };
 
   // Swallow the whole press so the page never acts on a click that was only meant to point.
@@ -199,7 +228,7 @@
     const element = event.target;
     if (!element || element.nodeType !== 1) return;
     try {
-      if (window.__smartopsInspectCapture) window.__smartopsInspectCapture(capture(element)).catch(() => {});
+      if (window.__smartopsInspectCapture) window.__smartopsInspectCapture(capture(element, event)).catch(() => {});
     } catch (error) { /* pointing at an element must never break the page */ }
   }, true);
 })();

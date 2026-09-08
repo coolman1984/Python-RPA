@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from . import fingerprint as fp
+from .discovery import DiscoveryManager
 from .core import cdp_url, http_url, validate_workflow, validate_xlsx, atomic_text
 
 
@@ -83,99 +83,46 @@ def record(page, output, stop):
             pass
 
 
-def accessibility_layer(page, token):
-    """The real accessibility tree over CDP, not a guess rebuilt from HTML attributes."""
-    if not token:
-        return fp.layer(fp.MISSING, "The element could not be tagged for lookup.")
-    try:
-        session = page.context.new_cdp_session(page)
-    except Exception as exc:
-        return fp.layer(fp.UNAVAILABLE, "The accessibility tree is not reachable: " + safe_error(exc))
-    try:
-        document = session.send("DOM.getDocument", {"depth": 0})
-        match = session.send("DOM.querySelector", {"nodeId": document["root"]["nodeId"], "selector": f'[data-smartops-probe="{token}"]'})
-        if not match.get("nodeId"):
-            return fp.layer(fp.MISSING, "The element was gone before the tree could be read.")
-        nodes = session.send("Accessibility.getPartialAXTree", {"nodeId": match["nodeId"], "fetchRelatives": False}).get("nodes", [])
-        node = next((n for n in nodes if not n.get("ignored")), None)
-        if node is None:
-            return fp.layer(fp.MISSING, "The system hides this element from assistive technology.", ignored=True)
-        role = (node.get("role") or {}).get("value", "")
-        name = (node.get("name") or {}).get("value", "")
-        states = {p["name"]: p.get("value", {}).get("value") for p in node.get("properties", []) if isinstance(p, dict) and p.get("name")}
-        if not role and not name:
-            return fp.layer(fp.MISSING, "The tree exposes no role or name for this element.", states=states)
-        return fp.layer(fp.FOUND, (role or "element") + (f' named "{name}"' if name else " with no accessible name"),
-                        role=role, name=name, states=states)
-    except Exception as exc:
-        return fp.layer(fp.MISSING, "Reading the accessibility tree failed: " + safe_error(exc))
-    finally:
+def arm_radar(page, pending):
+    """Install the page probe in every frame. Trusted clicks land in `pending`, not on the page."""
+    script = Path(__file__).with_name("probe.js").read_text(encoding="utf-8")
+    # The binding only queues. Screenshots and CDP calls happen on the caller's loop, so no
+    # Playwright call is ever made from inside a Playwright callback.
+    page.expose_binding("__smartopsInspectCapture",
+                        lambda source, payload: pending.append({"payload": payload, "frame": source["frame"]}) if source["page"] is page else None)
+    page.add_init_script(script)
+    installed = 0
+    for frame in page.frames:
+        # A frame that is cross-origin or mid-navigation is skipped, never fatal.
         try:
-            session.detach()
+            frame.evaluate(script)
+            installed += 1
+        except Exception:
+            pass
+    return installed
+
+
+def disarm_radar(page):
+    for frame in page.frames:
+        try:
+            frame.evaluate("window.__smartopsProbeArmed = false; window.__smartopsInspectCapture = undefined;")
         except Exception:
             pass
 
 
-def image_layer(page, run_dir, box, index, padding=60):
-    if not isinstance(box, dict) or not (box.get("width") and box.get("height")):
-        return fp.layer(fp.MISSING, "The element has no visible area to photograph.")
-    try:
-        size = page.viewport_size or {"width": 1920, "height": 1080}
-        def clip(pad):
-            left, top = max(0, box["x"] - pad), max(0, box["y"] - pad)
-            return {"x": left, "y": top,
-                    "width": max(1, min(box["width"] + pad * 2, size["width"] - left)),
-                    "height": max(1, min(box["height"] + pad * 2, size["height"] - top))}
-        element_png = Path(run_dir) / f"element-{index}.png"
-        context_png = Path(run_dir) / f"element-{index}-context.png"
-        page.screenshot(path=str(element_png), clip=clip(0))
-        page.screenshot(path=str(context_png), clip=clip(padding))
-        return fp.layer(fp.FOUND, f"{box['width']}x{box['height']} pixels, plus {padding} px of surroundings.",
-                        element_png=str(element_png), context_png=str(context_png), box=box)
-    except Exception as exc:
-        return fp.layer(fp.MISSING, "The screenshot failed: " + safe_error(exc))
-
-
-def build_fingerprint(page, run_dir, payload, index):
-    """Merge the page-side layers with the ones only the worker can reach, then store the result."""
-    payload = payload if isinstance(payload, dict) else {}
-    layers = dict(payload.get("layers") or {}) if isinstance(payload.get("layers"), dict) else {}
-    layers["accessibility"] = accessibility_layer(page, payload.get("token"))
-    layers["image"] = image_layer(page, run_dir, payload.get("box"), index)
-    layers["windows"] = fp.layer(fp.UNAVAILABLE, "The target is a browser tab, not a desktop window.")
-    layers["ocr"] = fp.layer(fp.UNAVAILABLE, "Screen-text reading is not built yet.")
-    layers["vision"] = fp.layer(fp.UNAVAILABLE, "Computer vision is not built yet.")
-    result = fp.normalize({**payload, "layers": layers})
-    atomic_text(Path(run_dir) / f"element-{index}.json", json.dumps(result, ensure_ascii=False, indent=2))
-    return result
-
-
-def arm_radar(page, pending):
-    """Install the page probe. Trusted clicks land in `pending` and never reach the page."""
-    script = Path(__file__).with_name("probe.js").read_text(encoding="utf-8")
-    # The binding only queues. Screenshots and CDP calls happen on the caller's loop, so no
-    # Playwright call is ever made from inside a Playwright callback.
-    page.expose_binding("__smartopsInspectCapture", lambda source, payload: pending.append(payload) if source["page"] is page else None)
-    page.add_init_script(script)
-    page.evaluate(script)
-
-
-def disarm_radar(page):
-    try:
-        page.evaluate("window.__smartopsProbeArmed = false; window.__smartopsInspectCapture = undefined;")
-    except Exception:
-        pass
-
-
-def drain_radar(page, run_dir, pending, output, index=0):
-    """Turn every queued click into a stored fingerprint. Returns the new element count."""
+def drain_radar(page, run_dir, pending, output, index=0, manager=None):
+    """Turn every queued click into one stored fingerprint. Returns the new element count."""
+    manager = manager or DiscoveryManager()
     while pending:
         index += 1
-        payload = pending.pop(0)
-        output.put({"type": "element", "index": index, "fingerprint": build_fingerprint(page, run_dir, payload, index)})
+        queued = pending.pop(0) or {}
+        payload, frame = queued.get("payload") or {}, queued.get("frame")
+        result = manager.discover_element(payload, page=page, run_dir=run_dir, index=index, frame=frame)
+        atomic_text(Path(run_dir) / f"element-{index}.json", json.dumps(result, ensure_ascii=False, indent=2))
+        output.put({"type": "element", "index": index, "fingerprint": result})
         try:
             page.evaluate("token => { const el = document.querySelector('[data-smartops-probe=\"' + token + '\"]'); if (el) el.removeAttribute('data-smartops-probe'); }",
-                          (payload or {}).get("token", ""))
+                          payload.get("token", ""))
         except Exception:
             pass
     return index
@@ -185,14 +132,15 @@ def inspect(page, run_dir, output, stop):
     """Arm the radar and report a fingerprint for each element the user points at."""
     Path(run_dir).mkdir(parents=True, exist_ok=True)
     pending = []
-    arm_radar(page, pending)
-    output.put({"type": "log", "message": "Radar armed. Click any element in the selected tab. The click is captured, not passed to the page."})
+    frames = arm_radar(page, pending)
+    output.put({"type": "log", "message": f"Radar armed across {frames} frame(s). Click any element in the selected tab. The click is captured, not passed to the page."})
     index = 0
+    manager = DiscoveryManager()
     try:
         while not stop.is_set():
             if page.is_closed():
                 raise RuntimeError("The inspected tab was closed. Fingerprints already captured are kept.")
-            index = drain_radar(page, run_dir, pending, output, index)
+            index = drain_radar(page, run_dir, pending, output, index, manager)
             page.wait_for_timeout(120)
     finally:
         disarm_radar(page)

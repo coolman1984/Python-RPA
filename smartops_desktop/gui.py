@@ -307,11 +307,13 @@ class MainWindow(QMainWindow):
         card.setContentsMargins(14, 0, 0, 0)
         self.radar_headline = label("No element pointed at yet.", "heading")
         card.addWidget(self.radar_headline)
-        self.radar_table = QTableWidget(len(fp.LAYERS), 3)
-        self.radar_table.setHorizontalHeaderLabels(["Layer", "Sees it?", "What it sees"])
-        self.radar_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.radar_table.setColumnWidth(0, 165)
-        self.radar_table.setColumnWidth(1, 80)
+        self.radar_table = QTableWidget(len(fp.LAYERS), 5)
+        self.radar_table.setHorizontalHeaderLabels(["Layer", "Sees it?", "Confidence", "What it sees", "Detector proven?"])
+        self.radar_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.radar_table.setColumnWidth(0, 150)
+        self.radar_table.setColumnWidth(1, 68)
+        self.radar_table.setColumnWidth(2, 80)
+        self.radar_table.setColumnWidth(4, 175)
         self.radar_table.verticalHeader().hide()
         self.radar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.radar_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -334,12 +336,17 @@ class MainWindow(QMainWindow):
 
     def render_radar(self, fingerprint):
         rows = fp.radar(fingerprint or {})
+        proof = {fp.VERIFIED: "verified in a real run", fp.IMPLEMENTED_UNVERIFIED: "code only, never proven", fp.NOT_IMPLEMENTED: "not implemented"}
         for row, item in enumerate(rows):
-            for column, value in enumerate([item["title"], item["icon"], item["detail"] or item["purpose"]]):
+            values = [item["title"], item["icon"], f"{item['confidence']:.2f}" if item["status"] == fp.FOUND else "—",
+                      item["detail"] or item["purpose"], proof[item["maturity"]]]
+            for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
-                if column == 1:
+                if column in (1, 2):
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if item["status"] != fp.FOUND:
+                if column == 4 and item["maturity"] != fp.VERIFIED:
+                    cell.setForeground(QColor("#a8701f"))
+                elif item["status"] != fp.FOUND:
                     cell.setForeground(QColor("#8b98a8" if item["status"] == fp.UNAVAILABLE else "#b33e4d"))
                 self.radar_table.setItem(row, column, cell)
         if not fingerprint:
@@ -350,7 +357,7 @@ class MainWindow(QMainWindow):
             return
         self.radar_headline.setText(fp.score(fingerprint)["headline"])
         self.radar_json.setPlainText(json.dumps(fingerprint, indent=2, ensure_ascii=False))
-        picture = (fingerprint["layers"]["image"]["data"] or {}).get("context_png", "")
+        picture = (fingerprint["layers"]["visual"]["data"] or {}).get("context_png", "")
         pixmap = QPixmap(picture) if picture and Path(picture).is_file() else QPixmap()
         if pixmap.isNull():
             self.radar_image.clear()
@@ -365,8 +372,9 @@ class MainWindow(QMainWindow):
         name = nexacro.get("name") or nexacro.get("component") or web.get("text") or web.get("id") or web.get("tag") or "element"
         self.element_list.addItem(f"{len(self.elements)}. {name}"[:60])
         self.element_list.setCurrentRow(len(self.elements) - 1)
-        found = fp.score(fingerprint)["identified"]
-        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by {found} layer(s)")
+        summary = fp.score(fingerprint)
+        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by "
+                                  f"{summary['identified']} layer(s), strongest {summary['best'] or 'none'} at {summary['best_confidence']:.2f}")
 
     def show_element(self, index):
         self.render_radar(self.elements[index] if 0 <= index < len(self.elements) else None)

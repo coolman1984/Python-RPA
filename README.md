@@ -36,30 +36,43 @@ The local Excel demo works without Chrome. No corporate workflow is included as 
 
 Recorder scope: trusted clicks, input changes, select/checkbox changes and Enter in the selected tab's **main frame**. Password and recognizable sign-in/secret fields are skipped. It does not record new tabs, iframe interactions, canvas controls, download events or native dialogs. It does not infer business intent, success conditions, or a reliable Nexacro adapter. Some controls emit more than one event; review duplicates. Sensitive data can still exist in ordinary business fields, so review recordings before exporting.
 
-## Element radar
+## Element radar — the discovery layer
 
 Before automating anything, ask what SmartOps can actually see. Pick a Chrome tab on the Workflows page, open **Element radar**, click **Start radar**, then click any element in that tab. The click is captured, not passed to the page, so pointing at a Save button never saves anything.
 
-Each element comes back as one card listing every independent way it was recognised:
+One user action produces one fingerprint through eleven independent detectors. `PROJECT-MAP.md` has the full flow, the confidence table and where each detector's output goes.
 
-| Layer | What it answers | This release |
-| --- | --- | --- |
-| Web element | Tag, id, name, text, selector, inner frame, new tab | built |
-| Nexacro component | Component, its form, grid, row, column and parent | built |
-| Accessibility tree | Role and accessible name, read over CDP | built |
-| Windows control | Desktop windows, menus, dialogs, system buttons | not built yet |
-| Anchor | A stable neighbour, so a moved or renamed element is still findable | built |
-| Image | A picture of the element and of the area around it | built |
-| Screen text | Text read off the screen as a clue to the location | not built yet |
-| Relative position | Placement inside its window or anchor, never the whole screen | built |
-| Keyboard route | Focus order and shortcuts, as a fallback path | built |
-| Computer vision | Last resort for what every other layer missed | not built yet |
+| # | Layer | What it answers | Detector proven? |
+| --- | --- | --- | --- |
+| 1 | Web element | Tag, id, name, text, selector | VERIFIED |
+| 2 | Frame and tab context | Which frame, the iframe chain, whether the target opens a new tab | VERIFIED |
+| 3 | Nexacro component | Component, type, path, form, grid, row, column, parent | IMPLEMENTED_UNVERIFIED |
+| 4 | Accessibility tree | Role and accessible name, read over CDP, piercing iframes | VERIFIED |
+| 5 | Windows UI Automation | Desktop windows, menus, dialogs, system controls | IMPLEMENTED_UNVERIFIED |
+| 6 | Anchor | A stable neighbour, so a moved or renamed element is still findable | VERIFIED |
+| 7 | Visual fingerprint | A picture of the element and of the area around it | VERIFIED |
+| 8 | Relative position | Placement inside its own container, never the whole screen | VERIFIED |
+| 9 | Keyboard route | Focus order and shortcuts, as a fallback path | VERIFIED |
+| 10 | Screen text (OCR) | Text read off the screen as a clue to the location | IMPLEMENTED_UNVERIFIED |
+| 11 | Computer vision | Last resort for what every other layer missed | IMPLEMENTED_UNVERIFIED |
 
-✅ means that layer identified the element, ❌ means it looked and could not, ⚪ means the layer is not available here. A layer that is not built yet always reads ⚪, never ❌, so the card never overstates what was tried.
+Each target reads back as a diagnostic:
 
-Every element is stored in the run folder as `element-N.json` plus two PNGs, so a fingerprint can be reviewed or compared later. Fingerprints record identity only — never the contents of a field — so they can be shared without carrying business data. Nexacro identification is read both from the live component and from the dotted id Nexacro renders into the page; the id route keeps working when component internals are unavailable. It has been exercised against a reproduction of that id shape, not yet against the live G-MES screens.
+```
+Web           ✅ 0.95      Anchor        ✅ 0.74
+Frame         ✅ 0.99      Visual        ✅ 0.65
+Nexacro       ✅ 0.85      Relative      ✅ 0.35
+Accessibility ✅ 0.82      Keyboard      ✅ 0.62
+Windows UIA   ⚪ unavailable
+```
 
-Nothing replays from a fingerprint yet. This release captures and shows them; choosing the best available layer at replay time is the next step.
+✅ found · ❌ the detector looked and could not · ⚪ the detector could not run here · ⚠️ the detector raised and the other ten carried on. Confidence answers one question: if this screen changes, how likely is this evidence to still point at the same element? A stable id scores 0.95; a positional selector 0.62; a Nexacro grid cell is capped at 0.75 because row and column follow the data, not the screen. Frame context is recorded but never ranked as a way of finding the element — it says where to look, not which element.
+
+**Proven and unproven are tracked separately from found and not found.** A detector that has never met the real system reports IMPLEMENTED_UNVERIFIED however well it scores today, and only VERIFIED layers count towards a confident verdict. Nexacro is IMPLEMENTED_UNVERIFIED: both routes run in a real browser against a reproduction of Nexacro's rendered id shape, but neither has met a live Nexacro runtime. Windows UIA, OCR and computer vision are adapters whose availability check is exercised everywhere and whose query path has never executed.
+
+Every element is stored in the run folder as `element-N.json` plus two PNGs. Fingerprints record identity only — `probe.js` reads no field values at all, and blanks the text of anything that looks like a credential while still recording that the element exists — so a fingerprint can be shared without carrying business data.
+
+Nothing replays from a fingerprint yet. This release observes, scores and stores; choosing the best available layer at replay time is the next step.
 
 ## G-MES / Nexacro
 
