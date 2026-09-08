@@ -26,7 +26,6 @@ def connect(playwright, settings):
         browser = playwright.chromium.connect_over_cdp(endpoint, timeout=8000)
     except Exception as exc:
         raise RuntimeError("Cannot connect to Chrome. In Settings, use a local Chrome CDP endpoint. Ordinary Chrome tabs do not expose CDP automatically.") from exc
-    # CDP also exists in other Chromium browsers; verify Google Chrome explicitly.
     session = browser.new_browser_cdp_session()
     info = session.send("Browser.getVersion")
     session.detach()
@@ -48,9 +47,16 @@ def select_page(browser, url):
 
 
 def safe_error(exc):
-    # Playwright call logs may include typed values or selectors. Keep the first line only.
     first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
     return re.sub(r"https?://\S+", "[page]", first)[:500]
+
+
+def _opener(target):
+    try:
+        value = target.opener
+        return value() if callable(value) else value
+    except Exception:
+        return None
 
 
 def record(page, output, stop, run_dir):
@@ -64,17 +70,11 @@ def record(page, output, stop, run_dir):
     def belongs_to_recording(target):
         if target == page:
             return True
-        try:
-            opener = target.opener
-        except Exception:
-            opener = None
+        opener = _opener(target)
         while opener:
             if opener in tracked_pages:
                 return True
-            try:
-                opener = opener.opener
-            except Exception:
-                break
+            opener = _opener(opener)
         return False
 
     def capture(source, step):
@@ -94,12 +94,10 @@ def record(page, output, stop, run_dir):
                 "is_main_frame": bool(source_frame == source_page.main_frame),
             }
             cleaned = enrich_recorded_step(source_page, source_frame, cleaned, run_dir, capture_index)
-            layers = summarize_layers(cleaned)
-            output.put({"type": "recorded", "step": cleaned, "layers": layers})
+            output.put({"type": "recorded", "step": cleaned, "layers": summarize_layers(cleaned)})
         except ValueError:
             pass
         except Exception as exc:
-            # Discovery is best-effort; never lose the user's recording because one probe failed.
             try:
                 fallback = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [step]})["steps"][0]
                 fallback["discovery"] = {"version": 1, "layers": {"enrichment": {"status": "error", "reason": safe_error(exc)}}}
@@ -114,7 +112,6 @@ def record(page, output, stop, run_dir):
         try:
             target.expose_binding("__smartopsCapture", capture)
         except Exception:
-            # A binding can already exist after a same-page reconnect; the JS guard prevents duplicate listeners.
             pass
         try:
             target.add_init_script(script)
@@ -145,7 +142,6 @@ def record(page, output, stop, run_dir):
             live = [p for p in tracked_pages if not p.is_closed()]
             if not live:
                 raise RuntimeError("All recorded tabs were closed. Captured steps remain available for review.")
-            # Polling a live page also services Playwright callbacks/bindings in sync mode.
             live[0].wait_for_timeout(100)
     finally:
         try:
@@ -226,7 +222,6 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
                 with page.expect_download(timeout=timeout) as pending:
                     target.click()
                 download = pending.value
-                # Ignore server filename and extension; validate bytes before naming XLSX.
                 candidate = run_dir / f"download-{number+1}.bin"
                 download.save_as(str(candidate))
                 last_file = candidate
@@ -263,7 +258,6 @@ def worker_main(mode, workflow, settings, run_dir, page_url, output, stop):
                     return
                 result = replay(workflow, settings, run_dir, output, stop, page)
                 output.put({"type": "tab_updated", "url": page.url})
-                # Leaving Playwright disconnects; never close the user's Chrome browser.
         else:
             result = replay(workflow, settings, run_dir, output, stop)
         output.put({"type": "done", "status": "passed", **result})
