@@ -14,7 +14,9 @@ from zipfile import ZipFile, BadZipFile
 import yaml
 from openpyxl import load_workbook
 
-ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export")
+from .discovery import fingerprint_size_ok
+
+ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export", "desktop_click", "desktop_press")
 DEFAULT_SETTINGS = {
     "cdp_url": "http://127.0.0.1:9222",
     "chrome_launcher": r"D:\WORK\Software Development\GitHub\AI CREW\Mandatory To Use Skills\windows-chrome-launcher\scripts\open_chrome.py",
@@ -78,7 +80,7 @@ def validate_workflow(raw):
         if action in {"click", "fill", "select", "check", "press", "download"}:
             if not isinstance(item.get("selector"), str) or not item["selector"].strip():
                 raise ValueError(f"Step {index}: a selector is required.")
-        if action in {"fill", "select", "press"} and not isinstance(item.get("value"), str):
+        if action in {"fill", "select", "press", "desktop_press"} and not isinstance(item.get("value"), str):
             raise ValueError(f"Step {index}: a text value is required.")
         if action == "fill" and re.search(r"password|passwd|secret|token|otp", item["selector"], re.I):
             raise ValueError("Credential fields must be filled manually, outside recording.")
@@ -92,6 +94,12 @@ def validate_workflow(raw):
                 raise ValueError("Minimum rows must be a non-negative integer.")
             if not isinstance(item.get("required_columns", []), list) or any(not isinstance(c, str) for c in item.get("required_columns", [])):
                 raise ValueError("Required columns must be a list of names.")
+        if action == "desktop_click" and not isinstance(item.get("fingerprint"), dict):
+            raise ValueError("Desktop click requires a discovery fingerprint.")
+        if "fingerprint" in item and not fingerprint_size_ok(item["fingerprint"]):
+            raise ValueError(f"Step {index}: discovery fingerprint is invalid or too large.")
+        if "detected_by" in item and (not isinstance(item["detected_by"], list) or any(not isinstance(v, str) for v in item["detected_by"])):
+            raise ValueError(f"Step {index}: detected_by must be a list of layer names.")
         clean["steps"].append(item)
     return clean
 
@@ -116,7 +124,6 @@ def validate_xlsx(path, min_rows=1, required_columns=(), sheet=None):
                 raise ValueError("Workbook expands beyond the 512 MB validation limit.")
             if archive.testzip():
                 raise ValueError("Workbook ZIP integrity check failed.")
-        # Passing a stream checks actual contents, independent of the extension.
         with path.open("rb") as stream:
             workbook = load_workbook(stream, read_only=True, data_only=True)
             try:
