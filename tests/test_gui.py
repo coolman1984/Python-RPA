@@ -93,3 +93,53 @@ def test_recording_stops_collecting_at_the_schema_limit(tmp_path):
     assert "limit reached" in window.status.text()
     window.store.save({"schema_version": 1, "name": "Recording", "steps": window.captured})
     window.close()
+
+
+def sample_fingerprint():
+    from smartops_desktop import fingerprint as fp
+    return fp.normalize({"source": "https://example.org/report", "layers": {
+        "web": {"status": fp.FOUND, "detail": "button · id btnSearch", "data": {"id": "btnSearch", "tag": "button"}},
+        "nexacro": {"status": fp.FOUND, "detail": "Button btnSearch · form divWork", "data": {"name": "btnSearch", "form": "divWork"}},
+        "accessibility": {"status": fp.MISSING, "detail": "The system hides this element."},
+        "anchor": {"status": fp.FOUND, "detail": '"Report date" above the element', "data": {"text": "Report date"}},
+        "relative": {"status": fp.FOUND, "detail": "3% across, 91% down its form"},
+    }})
+
+
+def test_radar_card_shows_one_row_per_layer_with_its_verdict(tmp_path):
+    from smartops_desktop import fingerprint as fp
+    window = window_with(tmp_path)
+    window.add_element(sample_fingerprint())
+    assert window.radar_table.rowCount() == len(fp.LAYERS)
+    verdicts = {window.radar_table.item(r, 0).text(): window.radar_table.item(r, 1).text() for r in range(window.radar_table.rowCount())}
+    assert verdicts["Web element"] == "✅"
+    assert verdicts["Nexacro component"] == "✅"
+    assert verdicts["Accessibility tree"] == "❌"
+    assert verdicts["Windows control"] == "⚪"
+    assert window.radar_headline.text().startswith("4 of 10")
+    assert window.element_list.count() == 1 and "btnSearch" in window.element_list.item(0).text()
+    window.close()
+
+
+def test_radar_keeps_every_pointed_element_and_switches_between_them(tmp_path):
+    from smartops_desktop import fingerprint as fp
+    window = window_with(tmp_path)
+    window.add_element(sample_fingerprint())
+    window.add_element(fp.normalize({"layers": {"web": {"status": fp.FOUND, "detail": "field · id qty", "data": {"id": "qty"}}}}))
+    assert window.element_list.count() == 2
+    window.element_list.setCurrentRow(0)
+    assert window.radar_headline.text().startswith("4 of 10")
+    window.element_list.setCurrentRow(1)
+    assert window.radar_headline.text().startswith("1 of 10")
+    window.close()
+
+
+def test_starting_the_radar_without_a_tab_asks_for_one(tmp_path, monkeypatch):
+    window = window_with(tmp_path)
+    window.workflow_list.setCurrentRow(0)
+    asked = []
+    monkeypatch.setattr(window, "notice", lambda title, message: asked.append(title))
+    window.start_worker("inspect")
+    assert asked == ["Choose Chrome tab"]
+    assert window.process is None
+    window.close()

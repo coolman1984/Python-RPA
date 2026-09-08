@@ -4,7 +4,7 @@ $buildPython = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $buildPython)) { throw 'Install requirements in .venv before building.' }
 & $buildPython -m pytest tests -q -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
-& $buildPython -m PyInstaller --noconfirm --clean --windowed --onedir --name SmartOps --add-data 'smartops_desktop/recorder.js;smartops_desktop' --hidden-import win32service --hidden-import win32gui --hidden-import win32con --hidden-import win32clipboard --collect-all playwright --copy-metadata PySide6 --copy-metadata PySide6_Essentials --copy-metadata shiboken6 --copy-metadata openpyxl --copy-metadata PyYAML --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module numpy --exclude-module pandas main.py
+& $buildPython -m PyInstaller --noconfirm --clean --windowed --onedir --name SmartOps --add-data 'smartops_desktop/recorder.js;smartops_desktop' --add-data 'smartops_desktop/probe.js;smartops_desktop' --hidden-import win32service --hidden-import win32gui --hidden-import win32con --hidden-import win32clipboard --collect-all playwright --copy-metadata PySide6 --copy-metadata PySide6_Essentials --copy-metadata shiboken6 --copy-metadata openpyxl --copy-metadata PyYAML --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets --exclude-module numpy --exclude-module pandas main.py
 if ($LASTEXITCODE -ne 0) { throw 'Packaging failed.' }
 Copy-Item -LiteralPath 'README.md' -Destination 'dist/SmartOps/START-HERE.md'
 Copy-Item -LiteralPath 'THIRD-PARTY-NOTICES.md' -Destination 'dist/SmartOps/THIRD-PARTY-NOTICES.md'

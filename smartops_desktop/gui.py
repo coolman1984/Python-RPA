@@ -10,13 +10,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QTimer, QProcess
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QStackedWidget, QLineEdit, QTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QFileDialog, QMessageBox,
     QInputDialog, QComboBox, QSpinBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QProgressBar, QFrame, QSplitter)
 
+from . import fingerprint as fp
 from .core import Store, ACTIONS, validate_workflow, atomic_text, http_url
 from .worker import worker_main
 
@@ -152,6 +153,7 @@ class MainWindow(QMainWindow):
         self.artifact = ""
         self.last_result = None
         self.captured = []
+        self.elements = []
         self.stop_deadline = None
         self.dead_since = None
         self.aux = []
@@ -173,7 +175,7 @@ class MainWindow(QMainWindow):
         sidebar.addSpacing(35)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.addItems(["Workflows", "Run history", "Settings"])
+        self.nav.addItems(["Workflows", "Element radar", "Run history", "Settings"])
         sidebar.addWidget(self.nav)
         sidebar.addWidget(label("DESKTOP CORE  /  0.1\nLocal storage · Windows", "tagline"))
         horizontal.addWidget(side)
@@ -181,6 +183,7 @@ class MainWindow(QMainWindow):
         self.stack.setObjectName("content")
         horizontal.addWidget(self.stack)
         self.build_workflows()
+        self.build_radar()
         self.build_history()
         self.build_settings()
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -279,6 +282,101 @@ class MainWindow(QMainWindow):
         self.log.setMaximumHeight(125)
         self.log.setPlaceholderText("Run activity appears here. Your workflows and results stay on this PC.")
         layout.addWidget(self.log)
+
+    def build_radar(self):
+        layout = self.page("What can SmartOps see?", "Point at any element and read back every independent way it can be recognised.")
+        toolbar = QHBoxLayout()
+        self.radar_button = button("📡  Start radar", lambda: self.start_worker("inspect"), True)
+        self.radar_stop = button("■  Stop", self.stop_worker)
+        self.radar_stop.setObjectName("danger")
+        self.radar_stop.setEnabled(False)
+        toolbar.addWidget(self.radar_button)
+        toolbar.addWidget(self.radar_stop)
+        toolbar.addStretch()
+        toolbar.addWidget(button("Open fingerprint folder", self.open_radar_folder))
+        layout.addLayout(toolbar)
+        self.radar_status = label("Pick a Chrome tab on the Workflows page, then start the radar and click an element.")
+        layout.addWidget(self.radar_status)
+        split = QSplitter()
+        self.element_list = QListWidget()
+        self.element_list.setMinimumWidth(175)
+        self.element_list.currentRowChanged.connect(self.show_element)
+        split.addWidget(self.element_list)
+        right = QWidget()
+        card = QVBoxLayout(right)
+        card.setContentsMargins(14, 0, 0, 0)
+        self.radar_headline = label("No element pointed at yet.", "heading")
+        card.addWidget(self.radar_headline)
+        self.radar_table = QTableWidget(len(fp.LAYERS), 3)
+        self.radar_table.setHorizontalHeaderLabels(["Layer", "Sees it?", "What it sees"])
+        self.radar_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.radar_table.setColumnWidth(0, 165)
+        self.radar_table.setColumnWidth(1, 80)
+        self.radar_table.verticalHeader().hide()
+        self.radar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.radar_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.radar_table.setAlternatingRowColors(True)
+        card.addWidget(self.radar_table, 1)
+        self.radar_image = QLabel()
+        self.radar_image.setFixedHeight(150)
+        self.radar_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.radar_image.setObjectName("card")
+        card.addWidget(self.radar_image)
+        self.radar_json = QTextEdit()
+        self.radar_json.setReadOnly(True)
+        self.radar_json.setMaximumHeight(140)
+        self.radar_json.setPlaceholderText("The full fingerprint appears here once you point at an element.")
+        card.addWidget(self.radar_json)
+        split.addWidget(right)
+        split.setSizes([175, 755])
+        layout.addWidget(split, 1)
+        self.render_radar(None)
+
+    def render_radar(self, fingerprint):
+        rows = fp.radar(fingerprint or {})
+        for row, item in enumerate(rows):
+            for column, value in enumerate([item["title"], item["icon"], item["detail"] or item["purpose"]]):
+                cell = QTableWidgetItem(str(value))
+                if column == 1:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if item["status"] != fp.FOUND:
+                    cell.setForeground(QColor("#8b98a8" if item["status"] == fp.UNAVAILABLE else "#b33e4d"))
+                self.radar_table.setItem(row, column, cell)
+        if not fingerprint:
+            self.radar_headline.setText("No element pointed at yet.")
+            self.radar_json.clear()
+            self.radar_image.clear()
+            self.radar_image.setText("No picture yet.")
+            return
+        self.radar_headline.setText(fp.score(fingerprint)["headline"])
+        self.radar_json.setPlainText(json.dumps(fingerprint, indent=2, ensure_ascii=False))
+        picture = (fingerprint["layers"]["image"]["data"] or {}).get("context_png", "")
+        pixmap = QPixmap(picture) if picture and Path(picture).is_file() else QPixmap()
+        if pixmap.isNull():
+            self.radar_image.clear()
+            self.radar_image.setText("No picture for this element.")
+        else:
+            self.radar_image.setPixmap(pixmap.scaled(self.radar_image.width() or 600, 146, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def add_element(self, fingerprint):
+        self.elements.append(fingerprint)
+        web = fingerprint["layers"]["web"]["data"] or {}
+        nexacro = fingerprint["layers"]["nexacro"]["data"] or {}
+        name = nexacro.get("name") or nexacro.get("component") or web.get("text") or web.get("id") or web.get("tag") or "element"
+        self.element_list.addItem(f"{len(self.elements)}. {name}"[:60])
+        self.element_list.setCurrentRow(len(self.elements) - 1)
+        found = fp.score(fingerprint)["identified"]
+        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by {found} layer(s)")
+
+    def show_element(self, index):
+        self.render_radar(self.elements[index] if 0 <= index < len(self.elements) else None)
+
+    def open_radar_folder(self):
+        path = self.store.root / "runs" / (self.run_id or "")
+        if not self.run_id or not path.is_dir():
+            self.notice("No fingerprints yet", "Start the radar and point at an element first.")
+            return
+        os.startfile(str(path))
 
     def build_history(self):
         layout = self.page("Every run, accounted for.", "Inspect outcomes, validation results and the local output folder.")
@@ -432,15 +530,15 @@ class MainWindow(QMainWindow):
             self.save_current()
 
     def set_busy(self, busy):
-        for item in [self.new_button, self.import_button, self.workflow_list, self.run_button, self.record_button, self.refresh_button, self.save_button, self.export_button, self.tabs, self.name, self.description, *self.edit_buttons]: item.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
+        for item in [self.new_button, self.import_button, self.workflow_list, self.run_button, self.record_button, self.refresh_button, self.save_button, self.export_button, self.tabs, self.name, self.description, self.radar_button, *self.edit_buttons]: item.setEnabled(not busy)
+        for item in [self.stop_button, self.radar_stop]: item.setEnabled(busy)
 
     def start_worker(self, mode):
         if self.process or not self.save_current(): return
         page_url = self.tabs.currentData() or ""
-        needs_page = mode == "record" or (mode == "replay" and any(s["action"] not in {"demo_export", "validate_xlsx", "wait"} for s in self.current["steps"]))
+        needs_page = mode in {"record", "inspect"} or (mode == "replay" and any(s.get("action") not in {"demo_export", "validate_xlsx", "wait"} for s in self.current["steps"]))
         if needs_page and not page_url:
-            self.notice("Choose Chrome tab", "Click Connect Chrome, then select the tab for this workflow. Connection instructions are in Settings.")
+            self.notice("Choose Chrome tab", "On the Workflows page click Connect Chrome, then select the tab to work with. Connection instructions are in Settings.")
             return
         if mode == "record":
             answer = QMessageBox.question(self, "Record a new workflow", "Sign in before recording. Captured steps will be saved as a new workflow for review. Record only the actions you want to replay. Start recording?")
@@ -453,7 +551,11 @@ class MainWindow(QMainWindow):
         self.stop_deadline = None
         self.log.clear()
         self.artifact_label.setText("No output file from this operation yet.")
-        self.run_id = self.store.start(self.current, "recording" if mode == "record" else "running") if mode != "tabs" else None
+        if mode == "inspect":
+            self.elements = []
+            self.element_list.clear()
+            self.render_radar(None)
+        self.run_id = self.store.start(self.current, {"record": "recording", "inspect": "inspecting"}.get(mode, "running")) if mode != "tabs" else None
         self.run_dir = self.store.root / "runs" / (self.run_id or "connection")
         try:
             context = mp.get_context("spawn")
@@ -470,7 +572,10 @@ class MainWindow(QMainWindow):
         self.set_busy(True)
         self.render_steps()
         self.progress.setRange(0, 0)
-        self.status.setText({"tabs": "Connecting to Google Chrome…", "record": "Recording · perform the task in your selected Chrome tab", "replay": "Running · automation is isolated from this window"}[mode])
+        self.status.setText({"tabs": "Connecting to Google Chrome…", "record": "Recording · perform the task in your selected Chrome tab",
+                             "inspect": "Radar armed · see the Element radar page", "replay": "Running · automation is isolated from this window"}[mode])
+        if mode == "inspect":
+            self.radar_status.setText("Radar armed · click any element in the selected Chrome tab. The click is captured, not passed to the page.")
 
     def stop_worker(self):
         if self.process:
@@ -505,6 +610,10 @@ class MainWindow(QMainWindow):
             index = self.tabs.currentIndex()
             if index >= 0:
                 self.tabs.setItemData(index, event["url"])
+            return
+        if kind == "element":
+            if self.run_id: self.store.event(self.run_id, {"type": "element", "index": event["index"]})
+            self.add_element(event["fingerprint"])
             return
         if kind == "recorded":
             if len(self.captured) >= 1000:
@@ -546,7 +655,10 @@ class MainWindow(QMainWindow):
         self.set_busy(False)
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if status == "passed" else 0)
-        self.status.setText({"passed": "Completed · " + ("Excel validation passed" if result.get("validated") else "all steps finished"), "connected": "Chrome connected · choose your tab", "recorded": "Recording saved · review the new workflow before replay", "cancelled": "Stopped · partial output retained", "failed": "Failed · " + result.get("message", "Check activity below")}.get(status, status))
+        self.status.setText({"passed": "Completed · " + ("Excel validation passed" if result.get("validated") else "all steps finished"), "connected": "Chrome connected · choose your tab", "recorded": "Recording saved · review the new workflow before replay", "inspected": "Radar stopped · fingerprints kept in the run folder", "cancelled": "Stopped · partial output retained", "failed": "Failed · " + result.get("message", "Check activity below")}.get(status, status))
+        if self.mode == "inspect":
+            self.radar_status.setText(f"Radar stopped · {len(self.elements)} element(s) captured." if self.elements
+                                      else "Radar stopped · no element was pointed at. " + result.get("message", ""))
         if status in {"failed", "cancelled"}:
             for row in range(self.steps.rowCount()):
                 if self.steps.item(row, 3).text() == "Running": self.steps.item(row, 3).setText(status.capitalize())

@@ -150,7 +150,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, workflow_id TEXT, name TEXT, started TEXT, finished TEXT, status TEXT, artifact TEXT, detail TEXT);
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, run_id TEXT, time TEXT, body TEXT);
         """)
-        self.db.execute("UPDATE runs SET status='interrupted', finished=? WHERE status IN ('running','recording')", (now(),))
+        self.db.execute("UPDATE runs SET status='interrupted', finished=? WHERE status IN ('running','recording','inspecting')", (now(),))
         self.db.commit()
         if self.db.execute("SELECT count(*) FROM workflows").fetchone()[0] == 0:
             self.save(demo_workflow())
