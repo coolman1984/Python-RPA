@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import re
-import time
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from .core import cdp_url, http_url, validate_workflow, validate_xlsx, atomic_text
+from .discovery import NetworkJournal, enrich_browser_capture, safe_http_url, normalize_capture, fingerprint_layers
+from .desktop_discovery import DesktopInputRecorder, probe_windows_at
 
 
 class Cancelled(Exception):
@@ -25,7 +27,6 @@ def connect(playwright, settings):
         browser = playwright.chromium.connect_over_cdp(endpoint, timeout=8000)
     except Exception as exc:
         raise RuntimeError("Cannot connect to Chrome. In Settings, use a local Chrome CDP endpoint. Ordinary Chrome tabs do not expose CDP automatically.") from exc
-    # CDP also exists in other Chromium browsers; verify Google Chrome explicitly.
     session = browser.new_browser_cdp_session()
     info = session.send("Browser.getVersion")
     session.detach()
@@ -47,39 +48,119 @@ def select_page(browser, url):
 
 
 def safe_error(exc):
-    # Playwright call logs may include typed values or selectors. Keep the first line only.
     first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
     return re.sub(r"https?://\S+", "[page]", first)[:500]
 
 
-def record(page, output, stop):
+def _layer_identity(fingerprint, layer):
+    for item in fingerprint.get("evidence", []):
+        if item.get("layer") == layer and item.get("available"):
+            return item.get("identity") or {}
+    return {}
+
+
+def record(page, output, stop, run_dir):
+    """Attended multi-layer discovery across frames, popups and native Windows UI."""
     from playwright.sync_api import Error
+
     script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8")
+    journal = NetworkJournal()
+    tracked_pages = set()
+    page_tokens = {}
+    page_relations = {}
+    counter = [0]
+    counter_lock = threading.Lock()
+
+    def next_sequence():
+        with counter_lock:
+            counter[0] += 1
+            return counter[0]
+
+    def emit(step, *, page_url="", frame_url="", metadata=None):
+        try:
+            item = dict(step)
+            if "fingerprint" not in item:
+                item["fingerprint"] = normalize_capture(item, page_url=page_url, frame_url=frame_url, metadata=metadata)
+                item["detected_by"] = fingerprint_layers(item["fingerprint"])
+            item.pop("evidence", None)
+            cleaned = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [item]})["steps"][0]
+            output.put({"type": "recorded", "step": cleaned})
+        except ValueError as exc:
+            output.put({"type": "log", "message": "Skipped one unsafe or invalid captured action: " + safe_error(exc)})
+
+    desktop = DesktopInputRecorder(lambda step: emit(step, metadata={"page_relation": "desktop"}), stop, Path(run_dir) / "discovery")
+    desktop_started = desktop.start()
+
     def capture(source, step):
-        if source["page"] != page or source["frame"] != page.main_frame or stop.is_set():
+        source_page = source["page"]
+        if source_page not in tracked_pages or stop.is_set():
+            return
+        sequence = next_sequence()
+        try:
+            enriched = enrich_browser_capture(
+                source_page, source["frame"], step, run_dir, sequence,
+                network=journal, windows_probe=probe_windows_at,
+                page_token=page_tokens.get(id(source_page), "page"),
+                relation=page_relations.get(id(source_page), "root"),
+            )
+            geometry = _layer_identity(enriched.get("fingerprint", {}), "relative_position")
+            if geometry.get("screen_x") is not None and geometry.get("screen_y") is not None:
+                desktop.mark_browser_event(geometry["screen_x"], geometry["screen_y"])
+            emit(enriched)
+        except Exception as exc:
+            output.put({"type": "log", "message": "One enrichment layer failed; the base event was normalized instead: " + safe_error(exc)})
+            emit(step, page_url=getattr(source_page, "url", ""), frame_url=getattr(source["frame"], "url", ""),
+                 metadata={"page_token": page_tokens.get(id(source_page), "page"), "page_relation": page_relations.get(id(source_page), "root")})
+
+    def instrument(target_page, relation="popup"):
+        if target_page in tracked_pages:
+            return
+        tracked_pages.add(target_page)
+        page_tokens[id(target_page)] = "page-" + str(len(page_tokens) + 1)
+        page_relations[id(target_page)] = relation
+        journal.attach(target_page)
+        try:
+            target_page.expose_binding("__smartopsCapture", capture)
+        except Exception as exc:
+            output.put({"type": "log", "message": "Could not attach recorder binding to one tracked page: " + safe_error(exc)})
             return
         try:
-            cleaned = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [step]})["steps"][0]
-            output.put({"type": "recorded", "step": cleaned})
-        except ValueError:
+            target_page.add_init_script(script)
+        except Exception:
             pass
-    page.expose_binding("__smartopsCapture", capture)
-    page.add_init_script(script)
-    page.evaluate(script)
+        for child_frame in list(target_page.frames):
+            try:
+                child_frame.evaluate(script)
+            except Exception:
+                pass
+        target_page.on("popup", lambda child: instrument(child, "popup"))
+        output.put({"type": "log", "message": f"Discovery attached to {page_tokens[id(target_page)]} ({relation})."})
+
+    instrument(page, "root")
     parsed = urlsplit(page.url)
     initial = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-    output.put({"type": "recorded", "step": {"action": "navigate", "url": initial, "label": "Open starting page (review URL parameters)"}})
-    output.put({"type": "log", "message": "Recording this tab's main frame. Sign in before recording. Password and sign-in fields are excluded. Review captured values before saving."})
+    emit({
+        "action": "navigate", "url": initial, "label": "Open starting page (review URL parameters)",
+        "evidence": [{"layer": "web", "available": True, "confidence": 0.9, "identity": {"url": safe_http_url(page.url)}}],
+    }, page_url=page.url, metadata={"page_token": "page-1", "page_relation": "root"})
+    output.put({"type": "log", "message":
+        "Universal discovery active: web, frames, popups, accessibility, Nexacro, anchors, geometry, visual and privacy-safe network clues"
+        + (", plus Windows UIA/native clicks." if desktop_started else ". Windows-native discovery is unavailable on this runtime.")})
     try:
         while not stop.is_set():
-            if page.is_closed():
-                raise RuntimeError("Recorded tab was closed. Captured steps remain available for review.")
+            if not any(not p.is_closed() for p in tracked_pages):
+                raise RuntimeError("All recorded browser pages were closed. Captured steps remain available for review.")
             page.wait_for_timeout(100)
     finally:
-        try:
-            page.evaluate("window.__smartopsCapture = undefined")
-        except Error:
-            pass
+        desktop.stop()
+        for tracked in list(tracked_pages):
+            if tracked.is_closed():
+                continue
+            for child_frame in list(tracked.frames):
+                try:
+                    child_frame.evaluate("window.__smartopsCapture = undefined")
+                except (Error, Exception):
+                    pass
 
 
 def replay(workflow, settings, run_dir, output, stop, page=None):
@@ -100,61 +181,52 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
             if stop.wait(step.get("seconds", 1)):
                 raise Cancelled()
         elif action == "demo_export":
-            book = Workbook()
-            sheet = book.active
-            sheet.title = "Production"
+            book = Workbook(); sheet = book.active; sheet.title = "Production"
             sheet.append(["Date", "Line", "Quantity"])
-            for line, qty in [("VD-01", 120), ("VD-02", 98), ("VD-03", 144)]:
-                sheet.append(["2026-09-08", line, qty])
-            last_file = run_dir / "sample-production.xlsx"
-            book.save(last_file)
-            book.close()
-            validated = False
+            for line, qty in [("VD-01", 120), ("VD-02", 98), ("VD-03", 144)]: sheet.append(["2026-09-08", line, qty])
+            last_file = run_dir / "sample-production.xlsx"; book.save(last_file); book.close(); validated = False
             output.put({"type": "artifact", "path": str(last_file)})
         elif action == "validate_xlsx":
             candidate = Path(step["path"]) if step.get("path") else last_file
-            if candidate is None:
-                raise ValueError("Add a download step or choose an existing file before validation.")
+            if candidate is None: raise ValueError("Add a download step or choose an existing file before validation.")
             result = validate_xlsx(candidate, step.get("min_rows", 1), step.get("required_columns", []), step.get("sheet") or None)
-            last_file = candidate
-            validated = True
+            last_file = candidate; validated = True
             output.put({"type": "validation", "path": str(candidate), "result": result, "message": f"Validation passed: {result['rows']} data rows in {result['sheet']}."})
+        elif action in {"desktop_click", "desktop_press"}:
+            raise ValueError("This desktop action was captured for discovery. Desktop replay is intentionally gated in this recorder-first branch.")
         elif page is None:
             raise ValueError("This action requires a connected Chrome tab.")
         elif action == "navigate":
             page.goto(http_url(step["url"]), wait_until="domcontentloaded")
         elif action == "nexacro_probe":
-            result = page.evaluate("""() => ({available: typeof nexacro !== 'undefined', application: typeof nexacro !== 'undefined' && typeof nexacro.getApplication === 'function', title: document.title, idCount: document.querySelectorAll('[id]').length})""")
+            result = page.evaluate("""() => {
+                const available = typeof nexacro !== 'undefined';
+                const app = available && typeof nexacro.getApplication === 'function' ? nexacro.getApplication() : null;
+                const form = app && typeof app.getActiveForm === 'function' ? app.getActiveForm() : null;
+                const focus = form && typeof form.getFocus === 'function' ? form.getFocus() : null;
+                const components = [];
+                if (form && form.components && typeof form.components.length === 'number') for (let i=0;i<Math.min(form.components.length,200);i++) {
+                    const c=form.components[i]; components.push({name:c&&(c.name||c.id)||'',type:c&&(c._type_name||c.constructor&&c.constructor.name)||''});
+                }
+                return {available, application:!!app, form:form&&(form.name||form.id)||'', focus:focus&&(focus.name||focus.id)||'', components, title:document.title, idCount:document.querySelectorAll('[id]').length};
+            }""")
             atomic_text(run_dir / "nexacro-probe.json", json.dumps(result, indent=2))
             output.put({"type": "log", "message": "Nexacro probe: " + json.dumps(result)})
         else:
             target = page.frame_locator(step["frame"]).locator(step["selector"]) if step.get("frame") else page.locator(step["selector"])
-            if action == "click":
-                target.click()
+            if action == "click": target.click()
             elif action == "fill":
-                if target.get_attribute("type") == "password":
-                    raise ValueError("Password fields require manual sign-in.")
+                if target.get_attribute("type") == "password": raise ValueError("Password fields require manual sign-in.")
                 target.fill(step["value"])
-            elif action == "select":
-                target.select_option(step["value"])
-            elif action == "check":
-                target.set_checked(step.get("checked", True))
-            elif action == "press":
-                target.press(step["value"])
+            elif action == "select": target.select_option(step["value"])
+            elif action == "check": target.set_checked(step.get("checked", True))
+            elif action == "press": target.press(step["value"])
             elif action == "download":
-                with page.expect_download(timeout=timeout) as pending:
-                    target.click()
-                download = pending.value
-                # Ignore server filename and extension; validate bytes before naming XLSX.
-                candidate = run_dir / f"download-{number+1}.bin"
-                download.save_as(str(candidate))
-                last_file = candidate
-                validated = False
-                output.put({"type": "artifact", "path": str(candidate)})
+                with page.expect_download(timeout=timeout) as pending: target.click()
+                download = pending.value; candidate = run_dir / f"download-{number+1}.bin"; download.save_as(str(candidate))
+                last_file = candidate; validated = False; output.put({"type": "artifact", "path": str(candidate)})
                 result = validate_xlsx(candidate, step.get("min_rows", 1), step.get("required_columns", []))
-                last_file = candidate.with_suffix(".xlsx")
-                candidate.rename(last_file)
-                validated = True
+                last_file = candidate.with_suffix(".xlsx"); candidate.rename(last_file); validated = True
                 output.put({"type": "validation", "path": str(last_file), "result": result, "message": f"Downloaded workbook validated: {result['rows']} rows."})
         check_cancel(stop)
         output.put({"type": "step", "index": number, "status": "passed", "message": f"Step {number+1} completed"})
@@ -165,24 +237,22 @@ def worker_main(mode, workflow, settings, run_dir, page_url, output, stop):
     try:
         if mode == "replay" and not workflow.get("steps"):
             raise ValueError("Add or record at least one step before running.")
-        browser_needed = mode in {"tabs", "record"} or any(s["action"] not in {"demo_export", "validate_xlsx", "wait"} for s in workflow.get("steps", []))
+        non_browser_replay = {"demo_export", "validate_xlsx", "wait", "desktop_click", "desktop_press"}
+        browser_needed = mode in {"tabs", "record"} or any(s["action"] not in non_browser_replay for s in workflow.get("steps", []))
         if browser_needed:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:
                 browser = connect(playwright, settings)
                 if mode == "tabs":
                     output.put({"type": "tabs", "tabs": [{"title": p.title(), "url": p.url} for p in pages_for(browser)]})
-                    output.put({"type": "done", "status": "connected"})
-                    return
+                    output.put({"type": "done", "status": "connected"}); return
                 page = select_page(browser, page_url)
                 if mode == "record":
-                    record(page, output, stop)
-                    output.put({"type": "tab_updated", "url": page.url})
-                    output.put({"type": "done", "status": "recorded"})
-                    return
+                    record(page, output, stop, run_dir)
+                    output.put({"type": "tab_updated", "url": page.url if not page.is_closed() else page_url})
+                    output.put({"type": "done", "status": "recorded"}); return
                 result = replay(workflow, settings, run_dir, output, stop, page)
                 output.put({"type": "tab_updated", "url": page.url})
-                # Leaving Playwright disconnects; never close the user's Chrome browser.
         else:
             result = replay(workflow, settings, run_dir, output, stop)
         output.put({"type": "done", "status": "passed", **result})
