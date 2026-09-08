@@ -73,12 +73,8 @@ def open_session(browser, run_dir, output, mode, target_id="", page_url=""):
 def record(page_or_browser, output, stop, run_dir, target_id="", page_url=""):
     """Attended recording across frames and popups, through the same discovery pipeline as the radar."""
     session = open_session(page_or_browser, run_dir, output, "record", target_id, page_url)
-    parsed = urlsplit(session.page.url)
     output.put({"type": "log", "message": "Recording started on " + (targets.short_location(session.page.url) or "the selected tab")
                 + ". Frames and any new tabs it opens are followed automatically."})
-    output.put({"type": "recorded", "step": {"action": "navigate",
-                "url": urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")),
-                "label": "Open starting page (review URL parameters)"}})
     session.run(stop)
     return session
 
@@ -128,6 +124,10 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
             last_file = candidate
             validated = True
             output.put({"type": "validation", "path": str(candidate), "result": result, "message": f"Validation passed: {result['rows']} data rows in {result['sheet']}."})
+        elif action == "secure_input":
+            # Never claim a run passed when a human still has to type the secret.
+            raise ValueError(f"Step {number+1} needs a password or code typed by hand. "
+                             "Sign in manually first, then remove or replace this step; SmartOps will not type credentials.")
         elif page is None:
             raise ValueError("This action requires a connected Chrome tab.")
         elif action == "navigate":
@@ -174,8 +174,10 @@ def worker_main(mode, workflow, settings, run_dir, page_url, output, stop, targe
     try:
         if mode == "replay" and not workflow.get("steps"):
             raise ValueError("Add or record at least one step before running.")
+        # secure_input is refused outright, so there is no point connecting to Chrome to say so.
+        offline_actions = {"demo_export", "validate_xlsx", "wait", "secure_input"}
         browser_needed = mode in {"tabs", "record", "inspect"} or any(
-            s.get("action") not in {"demo_export", "validate_xlsx", "wait"} for s in workflow.get("steps", []))
+            s.get("action") not in offline_actions for s in workflow.get("steps", []))
         if browser_needed:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:

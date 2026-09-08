@@ -239,7 +239,35 @@ recording**.
 
 ---
 
-## 12. Staging
+## 12. Stage 1 review round — five gaps found and closed
+
+A review of the branch found five correctness gaps the first round of tests had missed. Each is
+fixed with a regression test that fails against the old behaviour.
+
+| | Gap | Fix |
+| --- | --- | --- |
+| P0-1 | `secure_input` was emitted by the recorder but absent from `ACTIONS`, so a password interaction recorded fine and then made the whole workflow unsavable | `secure_input` is a first-class step: savable, never carrying a value, and refused out loud by replay instead of being silently dropped |
+| P0-2 | The probe defaulted to `radar`, so an iframe created after recording began could load in radar mode and **swallow a real user click** | The probe defaults to `off`; the session is the sole authority on mode and pushes it to every frame that appears, via `frameattached`, `framenavigated`, an init-script stamp and a periodic re-assert |
+| P0-3 | `REVIEW` was excluded from recovery, so a crash between Stop and Save lost an attended recording | Only `SAVED` and `DISCARDED` close a draft; `finalize()` marks it saved *after* the workflow really persisted |
+| P0-4 | The starting-page step went straight to the GUI and never reached `draft.jsonl`, so a recovered draft did not know where the automation began | `session.start_context()` journals it like every other step |
+| P0-5 | `desktop_discovery.py` was ported but `DesktopInputRecorder` was never started, so native Windows clicks were not being recorded at all | Wired into the same session and the same manager, with browser-originated events marked so one physical click cannot become two steps |
+| P1 | A nested-frame step kept only the last iframe selector | `frame_chain` and `frame_depth` preserve the whole route through save, reload and edit |
+
+Three further defects surfaced while proving those fixes, each found by watching real behaviour
+rather than by a failing assertion:
+
+- **Popups were never actually recorded.** `own()` ran inside Playwright's `popup` event callback,
+  where Playwright calls fail silently. The earlier test passed only because it called
+  `session.install()` by hand. Ownership is now taken on the session's own loop, and the test no
+  longer installs anything itself.
+- **A page that rewrites itself stopped being recorded.** `document.open()` — how `setContent` and
+  many portals work — wipes every listener while keeping the window and the Document object. A
+  one-shot install guard therefore returned early forever. Handlers are now defined once and
+  **re-attached** on every run.
+- **An interaction was dropped whenever enrichment failed.** A real user action is now always
+  recorded, with an explicit failed fingerprint, rather than disappearing.
+
+## 13. Staging
 
 **Stage 1 (this branch, now):** architecture reconciliation, the twelve issues, tests, evidence.
 **Stage 2 (after review):** the user journey itself — Record New Automation, preflight, target

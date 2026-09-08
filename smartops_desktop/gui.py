@@ -553,7 +553,7 @@ class MainWindow(QMainWindow):
         if self.process or not self.save_current(): return
         chosen = self.tabs.currentData() or {}
         target_id, page_url = chosen.get("target_id", ""), chosen.get("url", "")
-        needs_page = mode in {"record", "inspect"} or (mode == "replay" and any(s.get("action") not in {"demo_export", "validate_xlsx", "wait"} for s in self.current["steps"]))
+        needs_page = mode in {"record", "inspect"} or (mode == "replay" and any(s.get("action") not in {"demo_export", "validate_xlsx", "wait", "secure_input"} for s in self.current["steps"]))
         if needs_page and not target_id:
             self.notice("Choose Chrome tab", "On the Workflows page click Connect Chrome, then choose the tab to work with. Connection details live under Settings.")
             return

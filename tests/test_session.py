@@ -229,13 +229,11 @@ def test_a_new_tab_opened_from_the_target_joins_the_same_session(recorder):
     with page.expect_popup() as pending:
         page.click("#opener")
     popup = pending.value
-    page.wait_for_timeout(400)
-    assert len(session.pages) == 2 and any(p is popup for p in session.pages)
     popup.set_content("<button id='inPopup'>Continue</button>")
-    session.install(popup)
+    session.pump(1.2)   # the session adopts the new tab by itself; nothing is installed by hand
+    assert len(session.pages) == 2 and any(p is popup for p in session.pages)
     popup.click("#inPopup")
-    popup.wait_for_timeout(300)
-    steps = session.drain()
+    steps = session.pump(1.0)
     assert [step["action"] for step in steps] == ["click"]
     popup.close()
 
@@ -293,3 +291,217 @@ def test_ten_consecutive_recordings_of_the_same_action_agree(recorder):
         web = steps[0]["fingerprint"]["layers"]["web"]
         seen.append((steps[0]["action"], steps[0]["selector"], web["confidence"], steps[0]["best_layer"]))
     assert len(set(seen)) == 1, f"recordings drifted: {set(seen)}"
+
+
+# --- P0-1: a recorded credential step must survive being saved -----------------------------
+def test_a_recorded_secure_step_saves_reloads_and_never_carries_the_secret(tmp_path):
+    """Capturing a password step is worthless if the workflow it belongs to cannot be saved."""
+    from smartops_desktop.core import Store
+    store = Store(tmp_path / "data")
+    recorded = [
+        {"action": "navigate", "url": "https://example.org/portal", "label": "Open starting page"},
+        {"action": "secure_input", "selector": "#pw", "label": "Manual secure input required",
+         "secure": True, "fingerprint": {"schema_version": 2, "layers": {}}},
+        {"action": "click", "selector": "#save", "label": "Save report"},
+    ]
+    saved = store.save({"schema_version": 1, "name": "Portal sign-in", "steps": recorded})
+    reloaded = next(w for w in store.list_workflows() if w["id"] == saved["id"])
+    assert [step["action"] for step in reloaded["steps"]] == ["navigate", "secure_input", "click"]
+    secure = reloaded["steps"][1]
+    assert secure["secure"] is True and "value" not in secure
+    assert secure["fingerprint"] == {"schema_version": 2, "layers": {}}, "the fingerprint must survive the round trip"
+    assert "hunter2" not in json.dumps(reloaded)
+    store.db.close()
+
+
+def test_replay_refuses_a_secure_step_instead_of_reporting_success(tmp_path):
+    from smartops_desktop.worker import worker_main
+    output = queue.Queue()
+    import threading as _threading
+    workflow = {"schema_version": 1, "id": "secure-demo", "name": "Sign in", "steps": [
+        {"action": "demo_export", "label": "Create a report"},
+        {"action": "secure_input", "selector": "#pw", "label": "Manual secure input required"},
+    ]}
+    worker_main("replay", workflow, {}, tmp_path, "", output, _threading.Event())
+    events = [output.get_nowait() for _ in range(output.qsize())]
+    assert events[-1]["status"] == "failed"
+    assert "typed by hand" in events[-1]["message"]
+
+
+def test_a_secure_step_can_never_be_given_a_value(tmp_path):
+    from smartops_desktop.core import validate_workflow
+    with pytest.raises(ValueError, match="never carry a value"):
+        validate_workflow({"schema_version": 1, "name": "x",
+                           "steps": [{"action": "secure_input", "selector": "#pw", "value": "hunter2"}]})
+
+
+# --- P0-3 / P0-4: what a crash leaves behind ----------------------------------------------
+def test_a_crash_during_review_is_still_recoverable(tmp_path):
+    session = RecordingSession(None, tmp_path / "run", queue.Queue())
+    session.journal = DraftJournal(tmp_path / "run")
+    for state in (PREPARING, TARGET_PICK, ARMING, RECORDING, STOPPING, REVIEW):
+        session.move(state)
+    offered = DraftJournal.unfinished(tmp_path)
+    assert [item["state"] for item in offered] == [REVIEW], "review is not saved, so it must come back"
+
+
+def test_a_draft_stops_being_offered_only_after_the_workflow_is_really_saved(tmp_path):
+    session = RecordingSession(None, tmp_path / "run", queue.Queue())
+    session.journal = DraftJournal(tmp_path / "run")
+    for state in (PREPARING, TARGET_PICK, ARMING, RECORDING, STOPPING, REVIEW):
+        session.move(state)
+    assert DraftJournal.unfinished(tmp_path), "still open while the user is reviewing"
+    session.finalize(SAVED)
+    assert DraftJournal.unfinished(tmp_path) == []
+
+
+def test_a_failed_save_leaves_the_draft_recoverable(tmp_path):
+    session = RecordingSession(None, tmp_path / "run", queue.Queue())
+    session.journal = DraftJournal(tmp_path / "run")
+    for state in (PREPARING, TARGET_PICK, ARMING, RECORDING, STOPPING, REVIEW):
+        session.move(state)
+    try:
+        raise RuntimeError("disk full")  # the workflow never reached storage
+    except RuntimeError:
+        pass
+    assert DraftJournal.unfinished(tmp_path), "a draft may only close after a successful save"
+
+
+def test_an_explicitly_discarded_draft_is_not_offered_back(tmp_path):
+    session = RecordingSession(None, tmp_path / "run", queue.Queue())
+    session.journal = DraftJournal(tmp_path / "run")
+    for state in (PREPARING, TARGET_PICK, ARMING, RECORDING, STOPPING, REVIEW):
+        session.move(state)
+    session.discard()
+    assert DraftJournal.unfinished(tmp_path) == []
+
+
+@browser_only
+def test_the_recovered_draft_knows_which_page_the_automation_starts_on(recorder, tmp_path):
+    session, page = recorder(FORM)
+    page.click("#save")
+    page.wait_for_timeout(250)
+    session.drain()
+    recovered = session.journal.steps()
+    assert recovered[0]["action"] == "navigate", "the starting page must be step one of the draft"
+    assert recovered[0]["origin"] == "start_context"
+    assert recovered[0]["url"].startswith("http")
+    assert [step["action"] for step in recovered] == ["navigate", "click"]
+
+
+# --- P0-2: a frame that appears after recording started ------------------------------------
+@browser_only
+def test_an_iframe_added_after_recording_starts_does_not_swallow_the_click(recorder):
+    """The probe used to default to radar mode. A dynamically inserted frame would then eat the
+    user's real click instead of letting the page act on it."""
+    session, page = recorder("<h2>Outer</h2><div id='slot'></div>")
+    page.evaluate("""() => {
+        const frame = document.createElement('iframe');
+        frame.id = 'lateFrame';
+        frame.srcdoc = "<button id='late' onclick=\\"this.dataset.clicked='yes'\\">Later</button>";
+        document.getElementById('slot').appendChild(frame);
+    }""")
+    page.wait_for_timeout(600)
+    button = page.frame_locator("#lateFrame").locator("#late")
+    button.click()
+    steps = session.pump(1.5)
+    assert button.get_attribute("data-clicked") == "yes", "the page must still act on the click"
+    assert len(steps) == 1 and steps[0]["action"] == "click"
+
+
+@browser_only
+def test_a_frame_reloaded_after_recording_starts_keeps_recording(recorder):
+    session, page = recorder(
+        "<iframe id='f' srcdoc=\"<button id='b'>One</button>\"></iframe>")
+    page.evaluate("""() => { document.getElementById('f').srcdoc = "<button id='b' onclick=\\"document.title='REACHED'\\">Two</button>"; }""")
+    page.wait_for_timeout(600)
+    session.pump(1.5)          # the session re-asserts the probe on its own cadence
+    page.frame_locator("#f").locator("#b").click()
+    steps = session.pump(1.0)
+    assert len(steps) == 1 and steps[0]["action"] == "click"
+
+
+@browser_only
+def test_a_new_frame_while_paused_records_nothing_and_still_lets_the_page_act(recorder):
+    session, page = recorder("<h2>Outer</h2><div id='slot'></div>")
+    session.pause()
+    page.evaluate("""() => {
+        const frame = document.createElement('iframe');
+        frame.id = 'pausedFrame';
+        frame.srcdoc = "<button id='p' onclick=\\"document.title='REACHED'\\">Paused</button>";
+        document.getElementById('slot').appendChild(frame);
+    }""")
+    page.wait_for_timeout(600)
+    page.frame_locator("#pausedFrame").locator("#p").click()
+    assert session.pump(1.5) == [], "paused means capture nothing"
+    inner = page.frame_locator("#pausedFrame").locator("#p")
+    assert inner.is_visible(), "and the page must keep working normally"
+
+
+@browser_only
+def test_a_popup_that_navigates_after_being_attached_keeps_recording(recorder):
+    session, page = recorder(POPUP)
+    with page.expect_popup() as pending:
+        page.click("#opener")
+    popup = pending.value
+    page.wait_for_timeout(300)
+    popup.goto(ENDPOINT.rstrip("/") + "/json/version")
+    popup.set_content("<button id='afterNav'>Continue</button>")
+    session.pump(1.5)        # the session re-asserts ownership of the rewritten document itself
+    popup.click("#afterNav")
+    steps = session.pump(1.0)
+    assert [step["action"] for step in steps] == ["click"]
+    popup.close()
+
+
+# --- P0-5: native Windows capture, wired honestly ------------------------------------------
+def test_native_capture_reports_unavailable_rather_than_pretending(tmp_path):
+    session = RecordingSession(None, tmp_path, queue.Queue(), mode="record")
+    session.armed_mode = "record"
+    assert session.native_start() is False, "there is no Windows input hook on this runtime"
+    assert session.native_running is False
+
+
+def test_a_native_interaction_enters_the_same_pipeline_as_a_browser_one(tmp_path):
+    session = RecordingSession(None, tmp_path, queue.Queue(), mode="record")
+    session.native_step({"action": "desktop_click", "x": 640, "y": 480, "label": "OK"})
+    assert len(session.pending) == 1
+    queued = session.pending[0]
+    assert queued["native"] is True and queued["frame"] is None
+    assert queued["payload"]["screen"] == {"x": 640, "y": 480}
+    steps = session.drain()
+    assert len(steps) == 1 and steps[0]["action"] == "desktop_click"
+    assert set(steps[0]["fingerprint"]["layers"]) == set(fp.LAYER_KEYS)
+
+
+def test_a_browser_click_marks_itself_so_the_native_hook_cannot_double_count_it(tmp_path):
+    marked = []
+
+    class FakeHook:
+        def mark_browser_event(self, x, y): marked.append(("click", x, y))
+        def mark_browser_key(self, key): marked.append(("key", key))
+        def stop(self): pass
+
+    session = RecordingSession(None, tmp_path, queue.Queue(), mode="record")
+    session.native = FakeHook()
+    session.mark_browser({"screen": {"x": 100, "y": 200}, "action": "click"})
+    session.mark_browser({"action": "press", "value": "Control+S"})
+    assert marked == [("click", 100, 200), ("key", "Control+S")]
+
+
+# --- P1: the whole frame route survives ----------------------------------------------------
+@browser_only
+def test_a_nested_frame_step_keeps_the_entire_route_not_just_the_last_hop(recorder, tmp_path):
+    from smartops_desktop.core import Store
+    session, page = recorder(NESTED)
+    page.frame_locator("#outerFrame").frame_locator("#innerFrame").locator("#deep").click()
+    page.wait_for_timeout(300)
+    step = session.drain()[0]
+    assert step["frame_depth"] == 2
+    assert len(step["frame_chain"]) == 2 and step["frame"] == step["frame_chain"][-1]
+    # and it must survive save, reload and an edit
+    store = Store(tmp_path / "chain-data")
+    saved = store.save({"schema_version": 1, "name": "Nested", "steps": [step]})
+    reloaded = next(w for w in store.list_workflows() if w["id"] == saved["id"])["steps"][0]
+    assert reloaded["frame_chain"] == step["frame_chain"]
+    store.db.close()

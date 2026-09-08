@@ -14,7 +14,9 @@ from zipfile import ZipFile, BadZipFile
 import yaml
 from openpyxl import load_workbook
 
-ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export")
+# secure_input is a real, savable step: the recorder saw a credential field and deliberately kept
+# its identity without its value. Replay refuses it out loud rather than pretending it succeeded.
+ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export", "secure_input")
 DEFAULT_SETTINGS = {
     "cdp_url": "http://127.0.0.1:9222",
     "chrome_launcher": r"D:\WORK\Software Development\GitHub\AI CREW\Mandatory To Use Skills\windows-chrome-launcher\scripts\open_chrome.py",
@@ -77,7 +79,11 @@ def validate_workflow(raw):
         action = item["action"]
         if action == "navigate":
             http_url(item.get("url", ""))
-        if action in {"click", "fill", "select", "check", "press", "download"}:
+        if action == "secure_input":
+            if "value" in item:
+                raise ValueError(f"Step {index}: a secure input step must never carry a value.")
+            item["secure"] = True
+        if action in {"click", "fill", "select", "check", "press", "download", "secure_input"}:
             if not isinstance(item.get("selector"), str) or not item["selector"].strip():
                 raise ValueError(f"Step {index}: a selector is required.")
         if action in {"fill", "select", "press"} and not isinstance(item.get("value"), str):

@@ -2,12 +2,24 @@
 // and reports one element through as many independent layers as it can see.
 // It reports identity only: no field values, so a fingerprint never carries business data.
 (() => {
-  // mode 'radar'  : the click is swallowed and reported as a pointed-at element
-  // mode 'record' : the click reaches the page and is reported as a recorded action
-  // Both modes produce exactly the same evidence, so the radar and the recorder can never drift.
-  if (window.__smartopsProbeInstalled) { window.__smartopsProbeMode = window.__smartopsProbeMode || 'radar'; return; }
+  // Mode 'radar' swallows the click and reports a pointed-at element; 'record' lets it through and
+  // reports an action; 'off' does neither. Both modes produce identical evidence, so the radar and
+  // the recorder can never drift apart.
+  //
+  // Definitions are built once, but listeners are RE-ATTACHED on every run. document.open() — which
+  // is how a page rewrites itself, and how Playwright's setContent works — wipes every listener on
+  // the document while keeping the Document object and the window. A one-shot install guard would
+  // therefore return early and leave the page permanently unrecorded, with no error anywhere.
+  window.__smartopsProbeMode = window.__smartopsProbeMode || 'off';
+  const attach = () => {
+    for (const [type, handler] of (window.__smartopsProbeHandlers || [])) {
+      document.removeEventListener(type, handler, true);   // idempotent: never doubles up
+      document.addEventListener(type, handler, true);
+    }
+    document.__smartopsProbeAttached = true;
+  };
+  if (window.__smartopsProbeHandlers) { attach(); return; }
   window.__smartopsProbeInstalled = true;
-  window.__smartopsProbeMode = window.__smartopsProbeMode || 'radar';
 
   const FOUND = 'found', MISSING = 'missing', UNAVAILABLE = 'unavailable';
   const layer = (status, detail, data) => ({status, detail: String(detail || '').slice(0, 400), data: data || {}});
@@ -289,19 +301,29 @@
 
   // Swallow the whole press so the page never acts on a click that was only meant to point.
   const swallow = event => { event.preventDefault(); event.stopImmediatePropagation(); };
-  for (const name of ['mouseup', 'click', 'dblclick', 'contextmenu', 'submit']) {
-    document.addEventListener(name, event => { if (window.__smartopsProbeMode === 'radar' && event.isTrusted) swallow(event); }, true);
-  }
+  const onSwallow = event => { if (window.__smartopsProbeMode === 'radar' && event.isTrusted) swallow(event); };
   const report = payload => {
     try { if (window.__smartopsProbeCapture) window.__smartopsProbeCapture(payload).catch(() => {}); }
     catch (error) { /* pointing at or recording an element must never break the page */ }
   };
   const action = (name, el, event, extra) => {
     if (window.__smartopsProbeMode !== 'record' || !el || el.nodeType !== 1) return;
-    report({kind: 'action', action: name, ...capture(el, event), ...(extra || {})});
+    // Evidence gathering must never cost us the interaction itself. If any layer throws, the
+    // action is still reported, with the reason attached, rather than vanishing silently.
+    let observed;
+    try {
+      observed = capture(el, event);
+    } catch (error) {
+      observed = {layers: {}, capture_error: String((error && error.message) || error).slice(0, 200),
+                  source: location.href, page_title: document.title};
+    }
+    report({kind: 'action', action: name, ...observed, ...(extra || {})});
   };
 
-  document.addEventListener('click', event => {
+  const onClick = event => {
+    // One handler per event type, because attach() re-registers by identity. Radar still has to
+    // swallow the click here, or a pointed-at button would fire the page's own handler.
+    if (window.__smartopsProbeMode === 'radar' && event.isTrusted) { swallow(event); return; }
     if (window.__smartopsProbeMode !== 'record' || !event.isTrusted) return;
     const raw = event.target && event.target.nodeType === 1 ? event.target : null;
     if (!raw) return;
@@ -309,9 +331,9 @@
     // A plain text input reports through 'change'; clicking into it is not an action.
     if (el.matches && el.matches('input:not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio])')) return;
     action('click', el, event);
-  }, true);
+  };
 
-  document.addEventListener('change', event => {
+  const onChange = event => {
     if (window.__smartopsProbeMode !== 'record' || !event.isTrusted) return;
     const el = event.target;
     if (!el || el.nodeType !== 1) return;
@@ -319,9 +341,9 @@
     if (el.matches('input[type=checkbox],input[type=radio]')) action('check', el, event, {checked: !!el.checked});
     else if (el.matches('select')) action('select', el, event, {value: el.value});
     else if (el.matches('input:not([type=file]),textarea')) action('fill', el, event, {value: el.value});
-  }, true);
+  };
 
-  document.addEventListener('keydown', event => {
+  const onKeydown = event => {
     if (window.__smartopsProbeMode !== 'record' || !event.isTrusted) return;
     const el = event.target && event.target.nodeType === 1 ? event.target : document.activeElement;
     if (!el) return;
@@ -336,9 +358,9 @@
     if (!keys.length) return;
     if (sensitive(el)) { action('secure_input', el, event, {secure: true}); return; }
     action('press', el, event, {value: keys.join('+')});
-  }, true);
+  };
 
-  document.addEventListener('mousedown', event => {
+  const onMousedown = event => {
     if (window.__smartopsProbeMode !== 'radar' || !event.isTrusted) return;
     swallow(event);
     const element = event.target;
@@ -346,5 +368,10 @@
     try {
       report({kind: 'point', ...capture(element, event)});
     } catch (error) { /* pointing at an element must never break the page */ }
-  }, true);
+  };
+  window.__smartopsProbeHandlers = [
+    ['mouseup', onSwallow], ['dblclick', onSwallow], ['contextmenu', onSwallow], ['submit', onSwallow],
+    ['click', onClick], ['change', onChange], ['keydown', onKeydown], ['mousedown', onMousedown],
+  ];
+  attach();
 })();
