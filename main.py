@@ -1,5 +1,4 @@
 import multiprocessing
-import os
 import sys
 
 
@@ -25,5 +24,7 @@ if __name__ == "__main__":
             root.mkdir(parents=True, exist_ok=True)
             (root / "startup-error.log").write_text(traceback.format_exc(), encoding="utf-8")
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, "SmartOps could not start. Details: " + str(root / "startup-error.log"), "SmartOps", 16)
+            # The log is already on disk; the message box is a Windows-only courtesy.
+            if hasattr(ctypes, "windll"):
+                ctypes.windll.user32.MessageBoxW(None, "SmartOps could not start. Details: " + str(root / "startup-error.log"), "SmartOps", 16)
             raise

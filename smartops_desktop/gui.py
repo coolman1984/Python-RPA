@@ -334,16 +334,8 @@ class MainWindow(QMainWindow):
     def select_workflow(self, index):
         if index < 0 or index >= len(self.items): return
         if self.current:
-            try:
-                self.current["name"] = self.name.text()
-                self.current["description"] = self.description.text()
-                self.store.save(self.current)
-                for i, value in enumerate(self.items):
-                    if value["id"] == self.current["id"]:
-                        self.items[i] = json.loads(json.dumps(self.current))
-                        self.workflow_list.item(i).setText(self.current["name"])
-            except ValueError:
-                pass
+            error = self.persist()
+            if error: self.notice("Edit not saved", error + "\n\nSwitching workflows discards that change.")
         self.current = json.loads(json.dumps(self.items[index]))
         self.name.setText(self.current["name"])
         self.description.setText(self.current.get("description", ""))
@@ -355,21 +347,27 @@ class MainWindow(QMainWindow):
             for col, value in enumerate([row+1, step["action"], step.get("label") or step.get("selector") or step.get("url") or step.get("path") or "—", "Ready"]):
                 self.steps.setItem(row, col, QTableWidgetItem(str(value)))
 
-    def save_current(self):
-        if not self.current: return False
+    def persist(self):
+        """Save pending name/description edits. Returns None, or the reason it could not be saved."""
+        if not self.current: return "No workflow is selected."
         try:
             self.current["name"] = self.name.text()
             self.current["description"] = self.description.text()
             self.current = self.store.save(self.current)
-            index = self.workflow_list.currentRow()
-            if index >= 0:
-                self.items[index] = json.loads(json.dumps(self.current))
-                self.workflow_list.item(index).setText(self.current["name"])
+            # Look the row up by ID: while switching workflows the selected row is already the new one.
+            for i, value in enumerate(self.items):
+                if value["id"] == self.current["id"]:
+                    self.items[i] = json.loads(json.dumps(self.current))
+                    self.workflow_list.item(i).setText(self.current["name"])
             self.status.setText("Saved locally.")
-            return True
+            return None
         except Exception as exc:
-            self.notice("Could not save", exc)
-            return False
+            return str(exc)
+
+    def save_current(self):
+        error = self.persist()
+        if error: self.notice("Could not save", error)
+        return error is None
 
     def new_workflow(self):
         name, ok = QInputDialog.getText(self, "New workflow", "Workflow name")
@@ -509,6 +507,9 @@ class MainWindow(QMainWindow):
                 self.tabs.setItemData(index, event["url"])
             return
         if kind == "recorded":
+            if len(self.captured) >= 1000:
+                self.status.setText("Recording · 1,000 step limit reached. Click Stop to keep what was captured.")
+                return
             self.captured.append(event["step"])
             self.status.setText(f"Recording · {len(self.captured)} steps captured")
             self.log.insertPlainText(f"Captured: {event['step']['action']}\n")
@@ -527,8 +528,9 @@ class MainWindow(QMainWindow):
             self.artifact_label.setText(("Validated Excel · " if kind == "validation" else "Saved file · ") + self.artifact)
         elif kind == "tabs":
             self.tabs.clear()
+            # Keep a non-selectable first entry so a run never targets a tab the user did not pick.
+            self.tabs.addItem("Choose a Chrome tab for browser steps" if event["tabs"] else "No http(s) tabs found", "")
             for tab in event["tabs"]: self.tabs.addItem(tab["title"] or tab["url"], tab["url"])
-            if not event["tabs"]: self.tabs.addItem("No http(s) tabs found", "")
         elif kind == "done":
             self.last_result = event
 
@@ -548,10 +550,17 @@ class MainWindow(QMainWindow):
         if status in {"failed", "cancelled"}:
             for row in range(self.steps.rowCount()):
                 if self.steps.item(row, 3).text() == "Running": self.steps.item(row, 3).setText(status.capitalize())
-        if self.mode == "record" and self.captured:
-            flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download. Main-frame recording only.", "steps": self.captured})
-            self.current = None
-            self.reload_workflows(flow["id"])
+        if self.mode == "record":
+            if not self.captured:
+                self.status.setText("Recording stopped · nothing was captured, so no workflow was saved.")
+            else:
+                try:
+                    flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download. Main-frame recording only.", "steps": self.captured})
+                    self.current = None
+                    self.reload_workflows(flow["id"])
+                except Exception as exc:
+                    self.status.setText("Recording could not be saved · " + str(exc))
+                    self.notice("Recording not saved", exc)
         self.reload_history()
 
     def reload_history(self):
@@ -604,7 +613,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.status.setText("Stopping worker. Close the window again after it finishes.")
             return
-        if not self.save_current():
+        error = self.persist()
+        if error and QMessageBox.question(self, "Close without saving?", "Your latest edit could not be saved: " + error + "\n\nClose SmartOps and discard that change?") != QMessageBox.StandardButton.Yes:
             event.ignore()
             return
         self.store.db.close()
