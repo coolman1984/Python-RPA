@@ -3,6 +3,7 @@ from pathlib import Path
 from smartops_desktop.core import validate_workflow
 from smartops_desktop.discovery import summarize_layers
 from smartops_desktop.desktop_recorder import _relative
+from smartops_desktop.discovery_ui import layer_summary
 
 
 def test_workflow_preserves_discovery_fingerprint():
@@ -50,3 +51,20 @@ def test_desktop_observer_never_declares_raw_typing_capture():
     assert "Raw character typing is deliberately not captured" in source
     assert "discover_native" in source
     assert "visual" in source
+
+
+def test_fill_discovery_does_not_duplicate_value_in_visual_or_accessibility_evidence():
+    source = (Path(__file__).parents[1] / "smartops_desktop" / "discovery.py").read_text(encoding="utf-8")
+    assert 'skipped_privacy' in source
+    assert '"value": _text(value)' not in source
+
+
+def test_ui_summarizes_available_and_fallback_layers():
+    step = {"discovery": {"layers": {
+        "dom": {"status": "ok"},
+        "nexacro": {"status": "unavailable"},
+        "anchors": {"status": "ok"},
+    }}}
+    headline, detail = layer_summary(step)
+    assert headline == "Seen 2/3"
+    assert "dom" in detail and "anchors" in detail and "nexacro: unavailable" in detail
