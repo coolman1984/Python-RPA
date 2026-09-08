@@ -15,8 +15,10 @@ if __name__ == "__main__":
         raise SystemExit(main())
     else:
         try:
-            from smartops_desktop.gui import main
-            raise SystemExit(main())
+            from smartops_desktop import gui
+            from smartops_desktop.discovery_ui import install as install_discovery_ui
+            install_discovery_ui(gui.MainWindow)
+            raise SystemExit(gui.main())
         except Exception:
             import traceback
             from pathlib import Path
