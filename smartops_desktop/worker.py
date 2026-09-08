@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .core import cdp_url, http_url, validate_workflow, validate_xlsx, atomic_text
 from .discovery import enrich_recorded_step, summarize_layers
+from .desktop_recorder import DesktopDiscoveryObserver
 
 
 class Cancelled(Exception):
@@ -60,12 +61,14 @@ def _opener(target):
 
 
 def record(page, output, stop, run_dir):
-    """Record selected Chrome page plus its child frames and popups with independent discovery layers."""
+    """Record selected Chrome page plus child frames/popups while observing the Windows desktop."""
     from playwright.sync_api import Error
 
     script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8")
     tracked_pages = set()
     capture_index = 0
+    desktop = DesktopDiscoveryObserver(output, stop, run_dir)
+    desktop.start()
 
     def belongs_to_recording(target):
         if target == page:
@@ -144,6 +147,7 @@ def record(page, output, stop, run_dir):
                 raise RuntimeError("All recorded tabs were closed. Captured steps remain available for review.")
             live[0].wait_for_timeout(100)
     finally:
+        desktop.stop()
         try:
             page.context.remove_listener("page", attach)
         except Exception:
