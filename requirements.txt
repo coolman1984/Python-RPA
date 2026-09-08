@@ -3,5 +3,8 @@ playwright==1.62.0
 openpyxl==3.1.5
 PyYAML==6.0.3
 pywin32>=311
+uiautomation==2.0.29
+pynput==1.8.2
+Pillow==12.3.0
 PyInstaller==6.22.2
 pytest>=9.0

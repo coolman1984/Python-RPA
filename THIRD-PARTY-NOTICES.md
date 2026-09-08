@@ -8,6 +8,9 @@ SmartOps bundles Python and packages installed from their upstream distributions
 - openpyxl: MIT. https://openpyxl.readthedocs.io/
 - PyYAML: MIT. https://github.com/yaml/pyyaml
 - pywin32: Python Software Foundation / project license. https://github.com/mhammond/pywin32
+- uiautomation: Apache License 2.0. https://pypi.org/project/uiautomation/
+- pynput: LGPLv3. https://pypi.org/project/pynput/
+- Pillow: MIT-CMU. https://pypi.org/project/pillow/
 - PyInstaller: GPL with bootloader exception allowing distribution of bundled applications. https://pyinstaller.org/
 
 No Chrome binary, account credentials, browser profile or corporate report is distributed in this package. Chrome remains a separately installed application.

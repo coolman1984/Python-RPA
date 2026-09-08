@@ -8,6 +8,8 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from .core import cdp_url, http_url, validate_workflow, validate_xlsx, atomic_text
+from .discovery import enrich_recorded_step, summarize_layers
+from .desktop_recorder import DesktopDiscoveryObserver
 
 
 class Cancelled(Exception):
@@ -25,7 +27,6 @@ def connect(playwright, settings):
         browser = playwright.chromium.connect_over_cdp(endpoint, timeout=8000)
     except Exception as exc:
         raise RuntimeError("Cannot connect to Chrome. In Settings, use a local Chrome CDP endpoint. Ordinary Chrome tabs do not expose CDP automatically.") from exc
-    # CDP also exists in other Chromium browsers; verify Google Chrome explicitly.
     session = browser.new_browser_cdp_session()
     info = session.send("Browser.getVersion")
     session.detach()
@@ -47,39 +48,119 @@ def select_page(browser, url):
 
 
 def safe_error(exc):
-    # Playwright call logs may include typed values or selectors. Keep the first line only.
     first = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
     return re.sub(r"https?://\S+", "[page]", first)[:500]
 
 
-def record(page, output, stop):
+def _opener(target):
+    try:
+        value = target.opener
+        return value() if callable(value) else value
+    except Exception:
+        return None
+
+
+def record(page, output, stop, run_dir):
+    """Record selected Chrome page plus child frames/popups while observing the Windows desktop."""
     from playwright.sync_api import Error
+
     script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8")
+    tracked_pages = set()
+    capture_index = 0
+    desktop = DesktopDiscoveryObserver(output, stop, run_dir)
+    desktop.start()
+
+    def belongs_to_recording(target):
+        if target == page:
+            return True
+        opener = _opener(target)
+        while opener:
+            if opener in tracked_pages:
+                return True
+            opener = _opener(opener)
+        return False
+
     def capture(source, step):
-        if source["page"] != page or source["frame"] != page.main_frame or stop.is_set():
+        nonlocal capture_index
+        source_page = source.get("page")
+        source_frame = source.get("frame")
+        if source_page not in tracked_pages or stop.is_set():
             return
         try:
             cleaned = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [step]})["steps"][0]
-            output.put({"type": "recorded", "step": cleaned})
+            capture_index += 1
+            cleaned["page_context"] = {
+                "url": source_page.url,
+                "is_popup": source_page != page,
+                "frame_url": source_frame.url if source_frame else source_page.url,
+                "frame_name": source_frame.name if source_frame else "",
+                "is_main_frame": bool(source_frame == source_page.main_frame),
+            }
+            cleaned = enrich_recorded_step(source_page, source_frame, cleaned, run_dir, capture_index)
+            output.put({"type": "recorded", "step": cleaned, "layers": summarize_layers(cleaned)})
         except ValueError:
             pass
-    page.expose_binding("__smartopsCapture", capture)
+        except Exception as exc:
+            try:
+                fallback = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [step]})["steps"][0]
+                fallback["discovery"] = {"version": 1, "layers": {"enrichment": {"status": "error", "reason": safe_error(exc)}}}
+                output.put({"type": "recorded", "step": fallback, "layers": []})
+            except Exception:
+                pass
+
+    def attach(target):
+        if target in tracked_pages or not belongs_to_recording(target):
+            return
+        tracked_pages.add(target)
+        try:
+            target.expose_binding("__smartopsCapture", capture)
+        except Exception:
+            pass
+        try:
+            target.add_init_script(script)
+        except Exception:
+            pass
+        try:
+            target.evaluate(script)
+        except Exception:
+            pass
+
+    tracked_pages.add(page)
+    try:
+        page.expose_binding("__smartopsCapture", capture)
+    except Exception:
+        pass
     page.add_init_script(script)
     page.evaluate(script)
+    page.context.on("page", attach)
+
     parsed = urlsplit(page.url)
     initial = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-    output.put({"type": "recorded", "step": {"action": "navigate", "url": initial, "label": "Open starting page (review URL parameters)"}})
-    output.put({"type": "log", "message": "Recording this tab's main frame. Sign in before recording. Password and sign-in fields are excluded. Review captured values before saving."})
+    output.put({"type": "recorded", "step": {"action": "navigate", "url": initial, "label": "Open starting page (review URL parameters)", "discovery": {"version": 1, "layers": {"navigation": {"status": "ok", "url": initial}}}}, "layers": ["navigation"]})
+    output.put({"type": "log", "message": "Multi-layer recording is active: DOM, Nexacro hints, Chrome accessibility, Windows UI Automation, Win32, anchors, visual crop and relative position. Child frames and popups are observed when Chrome exposes them."})
+    output.put({"type": "log", "message": "Sign in before recording. Password and recognizable sign-in fields are excluded. Review captured business values before sharing a workflow."})
+
     try:
         while not stop.is_set():
-            if page.is_closed():
-                raise RuntimeError("Recorded tab was closed. Captured steps remain available for review.")
-            page.wait_for_timeout(100)
+            live = [p for p in tracked_pages if not p.is_closed()]
+            if not live:
+                raise RuntimeError("All recorded tabs were closed. Captured steps remain available for review.")
+            live[0].wait_for_timeout(100)
     finally:
+        desktop.stop()
         try:
-            page.evaluate("window.__smartopsCapture = undefined")
-        except Error:
+            page.context.remove_listener("page", attach)
+        except Exception:
             pass
+        for target in list(tracked_pages):
+            if target.is_closed():
+                continue
+            try:
+                target.evaluate("window.__smartopsCapture = undefined")
+            except Error:
+                pass
+            except Exception:
+                pass
 
 
 def replay(workflow, settings, run_dir, output, stop, page=None):
@@ -145,7 +226,6 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
                 with page.expect_download(timeout=timeout) as pending:
                     target.click()
                 download = pending.value
-                # Ignore server filename and extension; validate bytes before naming XLSX.
                 candidate = run_dir / f"download-{number+1}.bin"
                 download.save_as(str(candidate))
                 last_file = candidate
@@ -176,13 +256,12 @@ def worker_main(mode, workflow, settings, run_dir, page_url, output, stop):
                     return
                 page = select_page(browser, page_url)
                 if mode == "record":
-                    record(page, output, stop)
-                    output.put({"type": "tab_updated", "url": page.url})
+                    record(page, output, stop, run_dir)
+                    output.put({"type": "tab_updated", "url": page.url if not page.is_closed() else page_url})
                     output.put({"type": "done", "status": "recorded"})
                     return
                 result = replay(workflow, settings, run_dir, output, stop, page)
                 output.put({"type": "tab_updated", "url": page.url})
-                # Leaving Playwright disconnects; never close the user's Chrome browser.
         else:
             result = replay(workflow, settings, run_dir, output, stop)
         output.put({"type": "done", "status": "passed", **result})
