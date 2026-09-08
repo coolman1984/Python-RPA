@@ -1,6 +1,6 @@
 # SmartOps Desktop Core 0.1
 
-A native Python / PySide6 Windows application. Workflow editing, attended browser recording and replay, separate automation processes, SQLite run history, versioned JSON workflows, YAML settings, and Excel validation.
+A native Python / PySide6 Windows application. Workflow editing, attended browser recording and replay, separate automation processes, SQLite run history, versioned JSON workflows, YAML settings, Excel validation, and an experimental multi-layer discovery recorder.
 
 ## Run the Windows package
 
@@ -15,7 +15,7 @@ The app is unsigned. It stores workflows, settings, downloads and run history un
 
 Create a workflow and add, edit, reorder or remove steps. Use Save to save title/description changes; step edits save immediately. Import assigns a new ID, so an imported workflow cannot overwrite an existing workflow. Export creates versioned JSON for review or transfer. Review exports for any business data or captured field values before sharing.
 
-Supported steps: navigate, click, fill, select, check, press, wait, download, validate_xlsx, nexacro_probe, demo_export. CSS and Playwright selectors are supported. Browser actions run on the selected tab, and an optional frame selector supports explicitly authored iframe steps. Steps execute once in order; failures stop the run. There are no unattended schedules, automatic retries, arbitrary Python or shell actions.
+Supported replay steps: navigate, click, fill, select, check, press, wait, download, validate_xlsx, nexacro_probe, demo_export. CSS and Playwright selectors are supported. Browser actions run on the selected tab, and an optional frame selector supports explicitly authored iframe steps. Steps execute once in order; failures stop the run. There are no unattended schedules, automatic retries, arbitrary Python or shell actions.
 
 ## Connect Google Chrome
 
@@ -25,20 +25,43 @@ Chrome remote debugging setup is an external prerequisite for browser features. 
 
 The local Excel demo works without Chrome. No corporate workflow is included as an allegedly verified automation.
 
+## Multi-layer recording and discovery
+
+When Record is active, SmartOps captures the normal replayable browser action and attaches independent discovery evidence to the same action. A failure in one discovery layer does not discard the recorded step.
+
+Current browser discovery layers:
+
+- DOM identity: selector, tag, id, name, role, label, visible text, ARIA data and geometry.
+- Nexacro hints: framework/application presence, DOM id chain, internal-object candidates when exposed, and accessibility-id candidates.
+- Chrome accessibility tree through CDP for main-frame DOM targets.
+- Anchors: nearby label, sibling and container text candidates.
+- Relative position: element rectangle, viewport and click position inside the target.
+- Visual fingerprint: a small PNG crop plus SHA-256 fingerprint stored with the recording run.
+- Child-frame context metadata and popup-page tracking.
+- Safe navigation/shortcut keys in addition to Enter.
+
+On Windows, a global discovery observer runs beside the browser recorder. For desktop clicks it records Windows UI Automation, Win32 window hierarchy, relative position, visible accessibility text and a small visual crop. It also observes navigation/shortcut keys. **Raw global character typing is deliberately not captured** to avoid silently recording passwords or sensitive text.
+
+Desktop observations are evidence in the run journal and `desktop-discovery/observations.jsonl`; they are not silently converted into replayable desktop steps yet. This branch is intentionally discovery-first.
+
+Visual crops are local evidence and are marked non-portable. Exporting a workflow JSON does not currently bundle those image files.
+
 ## Record → review → test
 
 1. Sign in, navigate to the starting screen in Chrome, then select its tab in SmartOps.
-2. Click Record. Perform the task in that tab, then click Stop in SmartOps.
-3. A new workflow is saved for review. The existing workflow is preserved.
+2. Click Record. Perform the task, then click Stop in SmartOps.
+3. A new browser workflow is saved for review; desktop discovery evidence remains in that recording run.
 4. Review the starting URL: query parameters and fragments are deliberately omitted by the recorder. Add any required non-secret parameters yourself.
-5. Review steps and selectors. Convert the export-triggering click into **download**. That action waits for a real completed download and validates it as Excel.
-6. Configure minimum data rows and required column names. Test run is a real replay and performs the recorded clicks in the selected tab.
+5. Review captured values, duplicate events, selectors and discovery fingerprints.
+6. Convert an export-triggering click into **download** when appropriate, then Test run.
 
-Recorder scope: trusted clicks, input changes, select/checkbox changes and Enter in the selected tab's **main frame**. Password and recognizable sign-in/secret fields are skipped. It does not record new tabs, iframe interactions, canvas controls, download events or native dialogs. It does not infer business intent, success conditions, or a reliable Nexacro adapter. Some controls emit more than one event; review duplicates. Sensitive data can still exist in ordinary business fields, so review recordings before exporting.
+Password and recognizable sign-in/secret browser fields are skipped. The recorder does not infer business intent or success conditions. Sensitive business data can still exist in ordinary fields, accessibility names, nearby text and screenshots, so review recordings before sharing.
 
 ## G-MES / Nexacro
 
-The Nexacro probe reports framework availability and a small structural summary without invoking business methods. Nexacro-specific selectors and reviewed steps can be authored, but this release does not include a validated G-MES Daily Report adapter. Existing learned portal paths must continue to use the established `gmes_actions.py` / `portal_actions.py` skills. No new corporate UI paths were learned or changed while building this package.
+Nexacro discovery is now multi-source rather than a single availability probe. The recorder collects framework hints from the page and also checks Windows/Chrome accessibility information, which may expose a component path or automation id. This is designed to help identify controls such as forms, buttons and grids even when ordinary HTML selectors are weak.
+
+This is **not yet a validated G-MES adapter**. Nexacro internals vary by product/version and some controls may still appear only as visual or accessibility targets. Real G-MES validation must be performed on the authorized machine before claiming reliable coverage.
 
 ## Excel verification
 
@@ -53,5 +76,7 @@ Stop requests cooperative cancellation; a stuck worker is terminated after three
 ## Develop and build
 
 Python 3.12 on Windows. Create `.venv`, install `requirements.txt`, then run `python main.py` from that environment. `build.ps1` runs the tests, builds a PyInstaller directory bundle, exercises the compiled executable with the real GUI and spawned demo worker, and creates the ZIP. PyInstaller and pytest are build dependencies, not required on the recipient's PC.
+
+The branch also includes a Windows GitHub Actions workflow for syntax and unit tests. API-created commits may not trigger repository Actions depending on GitHub/App settings, so absence of an Actions run is not proof of success.
 
 For an isolated diagnostic, set `SMARTOPS_SELFTEST_DIR` and run `SmartOps.exe --self-test`. This generates a JSON result and a GUI screenshot, using its own data directory. The ordinary GUI uses `SMARTOPS_DATA_DIR` only if you explicitly set that environment variable.
