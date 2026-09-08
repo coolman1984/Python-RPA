@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,17 @@ def _capture_patch(bbox, folder, sequence):
         return {"available": False, "reason": type(exc).__name__}
 
 
+def _looks_sensitive(info, name, automation_id, class_name):
+    hay = " ".join((name, automation_id, class_name))
+    if re.search(r"password|passwd|secret|token|otp|one.?time|credit.?card|cvv|cvc|login|sign.?in|username|email", hay, re.I):
+        return True
+    try:
+        native = getattr(info, "element", None)
+        return bool(getattr(native, "CurrentIsPassword", False))
+    except Exception:
+        return False
+
+
 def probe_windows_at(x, y, folder, sequence=0):
     if sys.platform != "win32":
         return {"windows_uia": {"available": False, "reason": "not_windows"}}
@@ -44,6 +56,18 @@ def probe_windows_at(x, y, folder, sequence=0):
         return {"windows_uia": {"available": False, "reason": type(exc).__name__}}
 
     info = getattr(element, "element_info", None)
+    name = ""
+    try:
+        name = _text(element.window_text())
+    except Exception:
+        pass
+    automation_id = _text(getattr(info, "automation_id", ""), 140) if info else ""
+    class_name = _text(getattr(info, "class_name", ""), 140) if info else ""
+    control_type = _text(getattr(info, "control_type", ""), 80) if info else ""
+    rect = _rect_dict(getattr(info, "rectangle", None)) if info else {}
+    if _looks_sensitive(info, name, automation_id, class_name):
+        return {"windows_uia": {"available": False, "reason": "sensitive_target", "sensitive": True}}
+
     chain = []
     current = element
     for _ in range(7):
@@ -69,20 +93,14 @@ def probe_windows_at(x, y, folder, sequence=0):
         for sibling in parent.children()[:30]:
             if sibling == element:
                 continue
-            name = _text(sibling.window_text())
-            if name:
-                anchors.append({"name": name, "control_type": _text(sibling.element_info.control_type, 80)})
+            sibling_name = _text(sibling.window_text())
+            if sibling_name:
+                anchors.append({"name": sibling_name, "control_type": _text(sibling.element_info.control_type, 80)})
             if len(anchors) >= 4:
                 break
     except Exception:
         pass
 
-    name = ""
-    try:
-        name = _text(element.window_text())
-    except Exception:
-        pass
-    rect = _rect_dict(getattr(info, "rectangle", None)) if info else {}
     if rect and 0 < rect.get("width", 0) <= 1600 and 0 < rect.get("height", 0) <= 1200:
         bbox = (rect["left"], rect["top"], rect["right"], rect["bottom"])
     else:
@@ -91,9 +109,9 @@ def probe_windows_at(x, y, folder, sequence=0):
         "windows_uia": {
             "available": True,
             "name": name,
-            "control_type": _text(getattr(info, "control_type", ""), 80) if info else "",
-            "automation_id": _text(getattr(info, "automation_id", ""), 140) if info else "",
-            "class_name": _text(getattr(info, "class_name", ""), 140) if info else "",
+            "control_type": control_type,
+            "automation_id": automation_id,
+            "class_name": class_name,
             "rectangle": rect,
             "parent_chain": chain,
             "anchors": anchors,
@@ -114,6 +132,7 @@ class DesktopInputRecorder:
         self.stop_event = stop_event
         self.artifact_dir = Path(artifact_dir)
         self._recent_browser = deque(maxlen=30)
+        self._recent_browser_keys = deque(maxlen=30)
         self._mouse = None
         self._keyboard = None
         self._timers = []
@@ -142,15 +161,24 @@ class DesktopInputRecorder:
         except Exception:
             pass
 
+    def mark_browser_key(self, key):
+        if key:
+            self._recent_browser_keys.append((time.monotonic(), str(key).lower()))
+
     def _is_browser_duplicate(self, x, y):
         now = time.monotonic()
-        return any(now - when <= 0.55 and math.hypot(float(x) - bx, float(y) - by) <= 12
+        return any(now - when <= 0.8 and math.hypot(float(x) - bx, float(y) - by) <= 12
                    for when, bx, by in list(self._recent_browser))
+
+    def _is_browser_key_duplicate(self, name):
+        now = time.monotonic()
+        return any(now - when <= 0.8 and recorded == name.lower()
+                   for when, recorded in list(self._recent_browser_keys))
 
     def _on_click(self, x, y, button, pressed, *args):
         if not pressed or self.stop_event.is_set():
             return
-        timer = threading.Timer(0.22, self._emit_click, args=(x, y, str(button)))
+        timer = threading.Timer(0.35, self._emit_click, args=(x, y, str(button)))
         timer.daemon = True; self._timers.append(timer); timer.start()
 
     def _emit_click(self, x, y, button):
@@ -159,9 +187,11 @@ class DesktopInputRecorder:
         self._sequence += 1
         probe = probe_windows_at(x, y, self.artifact_dir, self._sequence)
         uia = probe.get("windows_uia", {})
+        if uia.get("sensitive") or uia.get("reason") == "sensitive_target":
+            return
         evidence = [
             {"layer": "windows_uia", "available": bool(uia.get("available")), "confidence": 0.9 if uia.get("available") else 0,
-             "identity": {k:v for k,v in uia.items() if k != "available"}, "reason": "" if uia.get("available") else uia.get("reason", "unavailable")},
+             "identity": {k:v for k,v in uia.items() if k not in {"available", "sensitive"}}, "reason": "" if uia.get("available") else uia.get("reason", "unavailable")},
             {"layer": "relative_position", "available": True, "confidence": 0.3,
              "identity": {"screen_x": int(x), "screen_y": int(y), "button": button}},
         ]
@@ -178,9 +208,16 @@ class DesktopInputRecorder:
         if self.stop_event.is_set():
             return
         name = str(key).replace("Key.", "").lower()
-        if name in self.SPECIAL_KEYS:
-            self.callback({"action": "desktop_press", "label": f"Press {name}", "value": name,
-                           "evidence": [{"layer": "keyboard", "available": True, "confidence": 1.0, "identity": {"key": name}}]})
+        if name not in self.SPECIAL_KEYS:
+            return
+        timer = threading.Timer(0.25, self._emit_key, args=(name,))
+        timer.daemon = True; self._timers.append(timer); timer.start()
+
+    def _emit_key(self, name):
+        if self.stop_event.is_set() or self._is_browser_key_duplicate(name):
+            return
+        self.callback({"action": "desktop_press", "label": f"Press {name}", "value": name,
+                       "evidence": [{"layer": "keyboard", "available": True, "confidence": 1.0, "identity": {"key": name}}]})
 
     def stop(self):
         for listener in (self._mouse, self._keyboard):
