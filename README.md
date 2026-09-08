@@ -1,6 +1,6 @@
-# SmartOps Desktop Core 0.1
+# SmartOps Desktop Core 0.2 · Discovery Branch
 
-A native Python / PySide6 Windows application. Workflow editing, attended browser recording and replay, separate automation processes, SQLite run history, versioned JSON workflows, YAML settings, and Excel validation.
+A native Python / PySide6 Windows application for attended automation recording, workflow review/replay, SQLite run history, versioned JSON workflows, local evidence and Excel validation. This branch focuses first on making the recorder understand a target through several independent discovery layers before expanding replay.
 
 ## Run the Windows package
 
@@ -9,13 +9,13 @@ A native Python / PySide6 Windows application. Workflow editing, attended browse
 3. Select **Your first successful run**, then **Test run**. It creates a sample Excel report and validates its contents. No Python installation or terminal is needed.
 4. Open **Run history** to inspect the result and open its output folder.
 
-The app is unsigned. It stores workflows, settings, downloads and run history under `%LOCALAPPDATA%\SmartOpsDesktop`. Source and build files are included in the package's `source` folder. Moving the app does not delete its data.
+The app is unsigned. It stores workflows, settings, downloads, discovery evidence and run history under `%LOCALAPPDATA%\SmartOpsDesktop`. Source and build files are included in the package's `source` folder. Moving the app does not delete its data.
 
 ## Workflows
 
 Create a workflow and add, edit, reorder or remove steps. Use Save to save title/description changes; step edits save immediately. Import assigns a new ID, so an imported workflow cannot overwrite an existing workflow. Export creates versioned JSON for review or transfer. Review exports for any business data or captured field values before sharing.
 
-Supported steps: navigate, click, fill, select, check, press, wait, download, validate_xlsx, nexacro_probe, demo_export. CSS and Playwright selectors are supported. Browser actions run on the selected tab, and an optional frame selector supports explicitly authored iframe steps. Steps execute once in order; failures stop the run. There are no unattended schedules, automatic retries, arbitrary Python or shell actions.
+Supported replay steps remain: navigate, click, fill, select, check, press, wait, download, validate_xlsx, nexacro_probe and demo_export. The discovery recorder can additionally capture `desktop_click` and `desktop_press`, but those native actions are deliberately blocked from replay in this branch until the discovery layer is validated on real Windows systems.
 
 ## Connect Google Chrome
 
@@ -25,20 +25,44 @@ Chrome remote debugging setup is an external prerequisite for browser features. 
 
 The local Excel demo works without Chrome. No corporate workflow is included as an allegedly verified automation.
 
-## Record → review → test
+## Record → discover → review
 
 1. Sign in, navigate to the starting screen in Chrome, then select its tab in SmartOps.
-2. Click Record. Perform the task in that tab, then click Stop in SmartOps.
-3. A new workflow is saved for review. The existing workflow is preserved.
-4. Review the starting URL: query parameters and fragments are deliberately omitted by the recorder. Add any required non-secret parameters yourself.
-5. Review steps and selectors. Convert the export-triggering click into **download**. That action waits for a real completed download and validates it as Excel.
-6. Configure minimum data rows and required column names. Test run is a real replay and performs the recorded clicks in the selected tab.
+2. Click Record and perform the task normally.
+3. SmartOps records safe browser actions and builds one multi-layer fingerprint for each target.
+4. The recorder follows child frames and popups opened from the tracked page.
+5. While recording is active on Windows, it can also collect attended native-dialog/control clicks through Windows UI Automation.
+6. Click Stop. A new workflow is saved for review; the existing workflow is preserved.
 
-Recorder scope: trusted clicks, input changes, select/checkbox changes and Enter in the selected tab's **main frame**. Password and recognizable sign-in/secret fields are skipped. It does not record new tabs, iframe interactions, canvas controls, download events or native dialogs. It does not infer business intent, success conditions, or a reliable Nexacro adapter. Some controls emit more than one event; review duplicates. Sensitive data can still exist in ordinary business fields, so review recordings before exporting.
+Each fingerprint can contain evidence from:
+
+- Web/DOM identity and ranked selector candidates.
+- Browser accessibility/ARIA information.
+- Nexacro application, active form, focused component, component path and Grid/Dataset clues when exposed.
+- Windows UI Automation control identity and parent/nearby controls.
+- Nearby anchors and labels.
+- Relative screen/viewport position and Canvas-relative click position.
+- Local visual evidence of the target/control.
+- Keyboard shortcuts/special keys.
+- Privacy-stripped nearby network request/response metadata.
+
+Password, login and secret-like fields are excluded. The browser sends a private suppression marker so the Windows fallback does not re-capture the same sensitive interaction. Browser and Windows hooks are also de-duplicated so one real click does not become two recorded steps.
+
+Query strings, URL fragments, request/response headers and bodies are not stored in network evidence. Visual evidence remains local in the run folder and must be reviewed before sharing.
+
+OCR and general computer-vision layers exist in the fingerprint model as explicit fallback slots but are **not** claimed as working engines yet. They stay unavailable until a real implementation is selected and tested.
 
 ## G-MES / Nexacro
 
-The Nexacro probe reports framework availability and a small structural summary without invoking business methods. Nexacro-specific selectors and reviewed steps can be authored, but this release does not include a validated G-MES Daily Report adapter. Existing learned portal paths must continue to use the established `gmes_actions.py` / `portal_actions.py` skills. No new corporate UI paths were learned or changed while building this package.
+The recorder now probes Nexacro more deeply than the original availability-only check. When the framework exposes the information, it records the application, active form, focused component, component path, display text, Grid cell position and bound Dataset row. The separate `nexacro_probe` step also reports active form/focus and a component summary.
+
+This is still **not a validated G-MES adapter**. The actual factory Nexacro version and representative Grid screens must be tested before calling this layer reliable. Existing learned portal paths remain untouched.
+
+## Replay boundary in this branch
+
+Browser replay and the existing Excel validation path remain available. Native Windows actions collected by the new recorder are discovery evidence only and intentionally fail fast if replay is attempted. This prevents the project from pretending a new fallback works before it has been proven.
+
+The next replay phase should choose among the stored discovery layers only after the recorder passes real stability tests.
 
 ## Excel verification
 
@@ -48,10 +72,14 @@ Validation uses the selected worksheet or the first sheet. Its first row is trea
 
 ## Cancellation and recovery
 
-Stop requests cooperative cancellation; a stuck worker is terminated after three seconds. The GUI remains responsive. Already completed actions cannot be undone, and partial files remain in the run folder. If the app exits unexpectedly, active runs are marked interrupted on the next launch. Browser connections are released without closing the user's Chrome. A lock prevents two desktop instances from writing the same database.
+Stop requests cooperative cancellation; a stuck worker is terminated after three seconds. The GUI remains responsive. Already completed actions cannot be undone, and partial files/evidence remain in the run folder. If the app exits unexpectedly, active runs are marked interrupted on the next launch. Browser connections are released without closing the user's Chrome. A lock prevents two desktop instances from writing the same database.
 
 ## Develop and build
 
-Python 3.12 on Windows. Create `.venv`, install `requirements.txt`, then run `python main.py` from that environment. `build.ps1` runs the tests, builds a PyInstaller directory bundle, exercises the compiled executable with the real GUI and spawned demo worker, and creates the ZIP. PyInstaller and pytest are build dependencies, not required on the recipient's PC.
+Python 3.12 on Windows. Create `.venv`, install `requirements.txt`, then run `python main.py` from that environment. `build.ps1` runs the tests and explicitly bundles Playwright plus the Windows UI Automation, global-input and image-capture dependencies before building the PyInstaller package. It then exercises the compiled executable with the existing self-test and creates the ZIP.
 
-For an isolated diagnostic, set `SMARTOPS_SELFTEST_DIR` and run `SmartOps.exe --self-test`. This generates a JSON result and a GUI screenshot, using its own data directory. The ordinary GUI uses `SMARTOPS_DATA_DIR` only if you explicitly set that environment variable.
+For an isolated diagnostic, set `SMARTOPS_SELFTEST_DIR` and run `SmartOps.exe --self-test`.
+
+## Acceptance gate before merge
+
+Do not merge this branch merely because the code exists. Run a real Windows test containing a normal web page, iframe, popup, native Windows dialog and representative G-MES/Nexacro screen. Repeat the same short recording ten times and compare the fingerprints. See `docs/RECORDER_DISCOVERY_V0_2.md` for the detailed gate.
