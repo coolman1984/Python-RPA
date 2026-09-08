@@ -4,7 +4,7 @@ import pytest
 
 from smartops_desktop.discovery import ElementFingerprint, LAYER_ORDER, normalize_capture, safe_http_url, fingerprint_layers, NetworkJournal
 from smartops_desktop.core import validate_workflow
-from smartops_desktop.desktop_discovery import probe_windows_at
+from smartops_desktop.desktop_discovery import probe_windows_at, DesktopInputRecorder, _looks_sensitive
 from smartops_desktop.worker import replay
 
 
@@ -68,3 +68,16 @@ class PageEvents:
 def test_network_journal_is_privacy_stripped():
     p=PageEvents(); j=NetworkJournal(); j.attach(p); p.handlers['request'](Request()); p.handlers['response'](Response())
     events=j.snapshot(); assert events[0]['url']=='https://example.org/api/export'; assert 'secret' not in str(events)
+
+
+def test_native_layer_dedupes_browser_mouse_and_keys(tmp_path):
+    recorder = DesktopInputRecorder(lambda step: None, threading.Event(), tmp_path)
+    recorder.mark_browser_event(100, 200)
+    recorder.mark_browser_key("Enter")
+    assert recorder._is_browser_duplicate(103, 204) is True
+    assert recorder._is_browser_key_duplicate("enter") is True
+
+
+def test_native_sensitive_identity_is_blocked():
+    assert _looks_sensitive(None, "Password", "loginPassword", "Edit") is True
+    assert _looks_sensitive(None, "Production quantity", "qty", "Edit") is False
