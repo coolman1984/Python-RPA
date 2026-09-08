@@ -1,68 +1,22 @@
 (() => {
   if (window.__smartopsInstalled) return;
   window.__smartopsInstalled = true;
-  const sensitive = el => /password|passwd|secret|token|otp|credit|card|username|email|login/i.test([el.type,el.name,el.id,el.autocomplete].join(' '));
-  const selector = el => {
-    if (el.id) return '#' + CSS.escape(el.id);
-    if (el.getAttribute('data-testid')) return '[data-testid="' + CSS.escape(el.getAttribute('data-testid')) + '"]';
-    if (el.name && document.querySelectorAll('[name="' + CSS.escape(el.name) + '"]').length === 1) return '[name="' + CSS.escape(el.name) + '"]';
-    let parts = [];
-    while (el && el.nodeType === 1 && parts.length < 8) {
-      let part = el.tagName.toLowerCase();
-      const siblings = el.parentElement ? [...el.parentElement.children].filter(x => x.tagName === el.tagName) : [];
-      if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(el)+1) + ')';
-      parts.unshift(part); el = el.parentElement;
-    }
-    return parts.join(' > ');
-  };
-  const text = el => (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0,120);
-  const evidence = el => {
-    const r = el.getBoundingClientRect();
-    const web = {tag:el.tagName.toLowerCase(), id:el.id||'', name:el.getAttribute('name')||'', role:el.getAttribute('role')||'', ariaLabel:el.getAttribute('aria-label')||'', text:text(el), selector:selector(el)};
-    const ax = {role:el.getAttribute('role') || (el.tagName.toLowerCase()==='button'?'button':''), name:el.getAttribute('aria-label') || text(el)};
-    const ev = [
-      {layer:'web',available:true,confidence:(el.id||el.getAttribute('data-testid'))?0.95:0.8,identity:web},
-      {layer:'accessibility',available:!!(ax.role||ax.name),confidence:ax.role&&ax.name?0.8:0.55,identity:ax},
-      {layer:'relative_position',available:true,confidence:0.35,identity:{x:r.x/window.innerWidth,y:r.y/window.innerHeight,w:r.width/window.innerWidth,h:r.height/window.innerHeight}}
-    ];
-    const parent = el.parentElement;
-    if (parent) {
-      const candidates=[...parent.children].filter(x=>x!==el && text(x));
-      if(candidates.length) ev.push({layer:'anchor',available:true,confidence:0.55,identity:{text:text(candidates[0]),relation:'sibling',targetSelector:selector(el)}});
-    }
-    try {
-      const nx = window.nexacro;
-      if (nx) {
-        const hints = {};
-        for (const node of [el, el.parentElement, el.parentElement && el.parentElement.parentElement].filter(Boolean)) {
-          for (const key of ['id','name','class']) if (node.getAttribute && node.getAttribute(key)) hints[key]=node.getAttribute(key);
-        }
-        ev.push({layer:'nexacro',available:true,confidence:0.4,identity:{framework:true,domHints:hints}});
-      }
-    } catch (_) {}
-    return ev;
-  };
-  const packet = (action,el,extra={}) => ({action,selector:selector(el),label:text(el)||action,evidence:evidence(el),...extra});
-  const send = step => { if (window.__smartopsCapture) window.__smartopsCapture(step).catch(() => {}); };
-  document.addEventListener('click', event => {
-    if (!event.isTrusted) return;
-    const el = event.target.closest('button,a,input,select,textarea,[role="button"],[role="tab"],[role="menuitem"],[id]');
-    if (!el || sensitive(el) || el.matches('input:not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])')) return;
-    send(packet('click',el));
-  }, true);
-  document.addEventListener('change', event => {
-    if (!event.isTrusted) return;
-    const el = event.target;
-    if (!el || sensitive(el)) return;
-    if (el.matches('input[type="checkbox"],input[type="radio"]')) send(packet('check',el,{checked:el.checked}));
-    else if (el.matches('select')) send(packet('select',el,{value:el.value}));
-    else if (el.matches('input:not([type="file"]),textarea')) send(packet('fill',el,{value:el.value}));
-  }, true);
-  document.addEventListener('keydown', event => {
-    if (!event.isTrusted || sensitive(event.target)) return;
-    if (event.key === 'Enter' && event.target.matches('input,textarea')) {
-      send(packet('fill',event.target,{value:event.target.value}));
-      send(packet('press',event.target,{value:'Enter',evidence:[...evidence(event.target),{layer:'keyboard',available:true,confidence:1,identity:{key:'Enter'}}]}));
-    }
-  }, true);
+  const clean=(v,n=220)=>String(v||'').replace(/\s+/g,' ').trim().slice(0,n);
+  const sensitive=el=>!!el && /password|passwd|secret|token|otp|one.?time|credit.?card|cvv|cvc|login|sign.?in|username/i.test([el.type,el.name,el.id,el.autocomplete,el.getAttribute?.('aria-label'),el.placeholder].join(' '));
+  const esc=v=>String(v||'').replace(/\\/g,'\\\\').replace(/"/g,'\\"');
+  const structural=el=>{let parts=[],cur=el;while(cur&&cur.nodeType===1&&parts.length<8){let p=cur.tagName.toLowerCase();if(cur.id){parts.unshift('#'+CSS.escape(cur.id));break;}const sib=cur.parentElement?[...cur.parentElement.children].filter(x=>x.tagName===cur.tagName):[];if(sib.length>1)p+=':nth-of-type('+(sib.indexOf(cur)+1)+')';parts.unshift(p);cur=cur.parentElement;}return parts.join(' > ');};
+  const candidates=el=>{const out=[];const add=(kind,value,confidence)=>{if(value&&!out.some(x=>x.value===value))out.push({kind,value,confidence});};if(el.id)add('id','#'+CSS.escape(el.id),.98);const tid=el.getAttribute('data-testid')||el.getAttribute('data-test')||el.getAttribute('data-qa');if(tid)add('testid','[data-testid="'+esc(tid)+'"]',.96);if(el.name&&document.querySelectorAll('[name="'+CSS.escape(el.name)+'"]').length===1)add('name','[name="'+esc(el.name)+'"]',.88);const role=el.getAttribute('role'),aria=el.getAttribute('aria-label');if(role&&aria)add('aria','[role="'+esc(role)+'"][aria-label="'+esc(aria)+'"]',.93);if(el.placeholder&&['INPUT','TEXTAREA'].includes(el.tagName))add('placeholder','[placeholder="'+esc(el.placeholder)+'"]',.82);add('structural',structural(el),.45);return out.sort((a,b)=>b.confidence-a.confidence);};
+  const selector=el=>candidates(el)[0]?.value||structural(el);
+  const role=el=>el.getAttribute('role')||(el.tagName==='BUTTON'?'button':el.tagName==='A'&&el.hasAttribute('href')?'link':el.tagName==='SELECT'?'combobox':el.tagName==='TEXTAREA'?'textbox':el.tagName==='INPUT'?(el.type==='checkbox'?'checkbox':el.type==='radio'?'radio':['submit','button','reset'].includes(el.type)?'button':'textbox'):'');
+  const accName=el=>{const ids=el.getAttribute('aria-labelledby');if(ids){const t=ids.split(/\s+/).map(id=>document.getElementById(id)?.innerText||'').join(' ');if(clean(t))return clean(t);}if(el.getAttribute('aria-label'))return clean(el.getAttribute('aria-label'));if(el.id){const lab=document.querySelector('label[for="'+CSS.escape(el.id)+'"]');if(lab&&clean(lab.innerText))return clean(lab.innerText);}const wrap=el.closest('label');if(wrap&&clean(wrap.innerText))return clean(wrap.innerText);return clean(el.innerText||el.placeholder||el.title||el.name||'');};
+  const anchors=el=>{const out=[];const add=(relation,node)=>{if(!node||out.length>=5)return;const text=clean(node.innerText||node.getAttribute?.('aria-label')||node.title||'',160);if(text&&!out.some(x=>x.text===text))out.push({relation,text,tag:(node.tagName||'').toLowerCase(),id:clean(node.id,80)});};if(el.id)add('label_for',document.querySelector('label[for="'+CSS.escape(el.id)+'"]'));add('wrapping_label',el.closest('label'));let s=el.previousElementSibling;for(let i=0;s&&i<3;i++,s=s.previousElementSibling)add('previous',s);let p=el.parentElement;for(let i=0;p&&i<3;i++,p=p.parentElement)add('container',p);return out;};
+  const compType=c=>{try{return clean(c?._type_name||c?.constructor?.name||String(c).replace(/^\[object\s+|\]$/g,''),100);}catch{return'';}};
+  const nexacroEvidence=()=>{try{if(typeof nexacro==='undefined'||typeof nexacro.getApplication!=='function')return null;const app=nexacro.getApplication();const form=typeof app.getActiveForm==='function'?app.getActiveForm():null;const focus=form&&typeof form.getFocus==='function'?form.getFocus():null;const path=[];let cur=focus;for(let i=0;cur&&i<8;i++){path.push({name:clean(cur.name||cur.id,120),type:compType(cur)});cur=cur.parent&&cur.parent!==cur?cur.parent:null;}const identity={application:clean(app.id||app.name,100),form:form?clean(form.name||form.id,120):'',component:focus?{name:clean(focus.name||focus.id,120),type:compType(focus),text:clean(typeof focus.getDisplayText==='function'?focus.getDisplayText():(focus.text||''),180),cell:typeof focus.getCellPos==='function'?Number(focus.getCellPos()):null,dataset_row:typeof focus.getBindDataset==='function'&&focus.getBindDataset()?Number(focus.getBindDataset().rowposition):null,path}:null};return{layer:'nexacro',available:true,confidence:focus?.name?.length?.9:.55,identity};}catch(e){return{layer:'nexacro',available:false,reason:clean(e?.name||'probe_error',80)};}};
+  const relative=(el,event)=>{const r=el.getBoundingClientRect();return{x:r.x/window.innerWidth,y:r.y/window.innerHeight,w:r.width/window.innerWidth,h:r.height/window.innerHeight,screen_x:Number.isFinite(event?.screenX)?event.screenX:null,screen_y:Number.isFinite(event?.screenY)?event.screenY:null,click_x_ratio:event&&r.width?(event.clientX-r.left)/r.width:null,click_y_ratio:event&&r.height?(event.clientY-r.top)/r.height:null,viewport_width:window.innerWidth,viewport_height:window.innerHeight,canvas:el.tagName==='CANVAS'};};
+  const evidence=(el,event)=>{const c=candidates(el),an=anchors(el),ax={role:role(el),name:accName(el)};const ev=[{layer:'web',available:true,confidence:c[0]?.confidence||.6,identity:{tag:el.tagName.toLowerCase(),id:el.id||'',name:el.getAttribute('name')||'',type:el.type||'',role:role(el),accessible_name:accName(el),text:clean(el.innerText,180),placeholder:clean(el.placeholder,140),title:clean(el.title,140),selector:selector(el),candidates:c}},{layer:'accessibility',available:!!(ax.role||ax.name),confidence:ax.role&&ax.name?.82:.55,identity:ax},{layer:'relative_position',available:true,confidence:.35,identity:relative(el,event)}];if(an.length)ev.push({layer:'anchor',available:true,confidence:.65,identity:{anchors:an}});const nx=nexacroEvidence();if(nx)ev.push(nx);return ev;};
+  const packet=(action,el,event,extra={})=>({action,selector:selector(el),label:accName(el)||clean(el.innerText)||action,evidence:evidence(el,event),...extra});
+  const send=step=>{if(window.__smartopsCapture)window.__smartopsCapture(step).catch(()=>{});};
+  document.addEventListener('click',event=>{if(!event.isTrusted)return;const raw=event.target?.nodeType===1?event.target:event.target?.parentElement;if(!raw)return;const el=raw.closest?.('button,a,input,textarea,select,canvas,[role],[id],[name]')||raw;if(!el||sensitive(el)||el.matches?.('input:not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'))return;send(packet('click',el,event));},true);
+  document.addEventListener('change',event=>{if(!event.isTrusted)return;const el=event.target;if(!el||sensitive(el))return;if(el.matches('input[type="checkbox"],input[type="radio"]'))send(packet('check',el,event,{checked:el.checked}));else if(el.matches('select'))send(packet('select',el,event,{value:el.value}));else if(el.matches('input:not([type="file"]),textarea'))send(packet('fill',el,event,{value:el.value}));},true);
+  document.addEventListener('keydown',event=>{if(!event.isTrusted||sensitive(event.target))return;const el=event.target?.nodeType===1?event.target:document.activeElement;if(!el)return;const special=event.key.length>1||event.ctrlKey||event.altKey||event.metaKey;if(!special)return;const keys=[];if(event.ctrlKey)keys.push('Control');if(event.altKey)keys.push('Alt');if(event.shiftKey)keys.push('Shift');if(event.metaKey)keys.push('Meta');if(!['Control','Alt','Shift','Meta'].includes(event.key))keys.push(event.key);if(!keys.length)return;if(event.key==='Enter'&&el.matches('input,textarea'))send(packet('fill',el,event,{value:el.value}));const p=packet('press',el,event,{value:keys.join('+')});p.evidence=[...p.evidence,{layer:'keyboard',available:true,confidence:1,identity:{key:keys.join('+')}}];send(p);},true);
 })();
