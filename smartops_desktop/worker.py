@@ -95,6 +95,16 @@ def record(page, output, stop, run_dir):
         source_page = source["page"]
         if source_page not in tracked_pages or stop.is_set():
             return
+        # Mark browser-originated input before slow enrichment so the native hook cannot duplicate it.
+        for raw in step.get("evidence", []):
+            if raw.get("layer") == "relative_position" and isinstance(raw.get("identity"), dict):
+                pos = raw["identity"]
+                if pos.get("screen_x") is not None and pos.get("screen_y") is not None:
+                    desktop.mark_browser_event(pos["screen_x"], pos["screen_y"])
+            elif raw.get("layer") == "keyboard" and isinstance(raw.get("identity"), dict):
+                desktop.mark_browser_key(raw["identity"].get("key"))
+        if step.get("action") == "__ignore_sensitive":
+            return
         sequence = next_sequence()
         try:
             enriched = enrich_browser_capture(
@@ -103,9 +113,6 @@ def record(page, output, stop, run_dir):
                 page_token=page_tokens.get(id(source_page), "page"),
                 relation=page_relations.get(id(source_page), "root"),
             )
-            geometry = _layer_identity(enriched.get("fingerprint", {}), "relative_position")
-            if geometry.get("screen_x") is not None and geometry.get("screen_y") is not None:
-                desktop.mark_browser_event(geometry["screen_x"], geometry["screen_y"])
             emit(enriched)
         except Exception as exc:
             output.put({"type": "log", "message": "One enrichment layer failed; the base event was normalized instead: " + safe_error(exc)})
