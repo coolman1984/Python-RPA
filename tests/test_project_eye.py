@@ -49,10 +49,13 @@ def test_the_real_map_validates_clean():
     assert "0 error(s)" in done.stdout
 
 
-def test_scan_finds_every_python_module_and_writes_a_graph():
-    done = run("scan")
+def test_scan_finds_every_python_module_and_writes_a_graph(sandbox):
+    """Runs in the sandbox: a test must never rewrite the repository it is testing."""
+    done = run("scan", cwd=sandbox)
     assert done.returncode == 0 and "Scanned" in done.stdout
-    assert (ROOT / ".project-eye" / "graph.yaml").exists()
+    graph = yaml.safe_load((sandbox / ".project-eye" / "graph.yaml").read_text(encoding="utf-8"))
+    assert "smartops_desktop/session.py" in graph["imports"]
+    assert "discovery" in graph["imports"]["smartops_desktop/session.py"]
 
 
 @pytest.mark.parametrize("journey", ["RECORD-ACTION", "ENRICH-ACTION", "SAVE-RECORDING", "RADAR-ELEMENT"])
