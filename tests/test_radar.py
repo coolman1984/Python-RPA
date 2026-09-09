@@ -64,9 +64,11 @@ def radar(tmp_path):
                 else:
                     page.click(selector, timeout=5000)
                 page.wait_for_timeout(250)
-            steps = session.drain()
+            session.pump(2.0)          # capture is instant; evidence arrives on the same loop
+            fingerprints = [step["fingerprint"] for step in session.journal.steps()
+                            if step.get("fingerprint")]
             session.finish()
-            return page, [step["fingerprint"] for step in steps]
+            return page, fingerprints
 
         yield point_at
         page.close()
@@ -178,9 +180,9 @@ def test_a_picture_and_a_draft_entry_are_kept_for_every_element(radar, tmp_path)
         assert os.path.isfile(image["element_png"]) and os.path.isfile(image["context_png"])
         assert image["sha256"]
     # Every accepted interaction is on disk the moment it is accepted, not held until Stop.
-    lines = (tmp_path / "draft.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
-    assert all(json.loads(line)["fingerprint"]["layers"]["web"]["status"] == fp.FOUND for line in lines)
+    operations = [json.loads(line) for line in (tmp_path / "draft.jsonl").read_text(encoding="utf-8").strip().splitlines()]
+    assert [op["op"] for op in operations] == ["add", "add", "enrich", "enrich"], \
+        "each element is recorded first, then enriched: append-only, never rewritten"
 
 
 def test_the_probe_leaves_no_marker_behind_on_the_page(radar):

@@ -43,7 +43,7 @@ LAYERS = (
     ("relative", "Relative", "Relative position", "Placement inside its own container, never the whole screen.", VERIFIED),
     ("keyboard", "Keyboard", "Keyboard route", "Focus order and shortcuts, as a fallback path.", VERIFIED),
     ("ocr", "OCR", "Screen text", "Text read off the screen, used as a clue to the location.", IMPLEMENTED_UNVERIFIED),
-    ("vision", "Vision", "Computer vision", "Last resort for what every other layer missed.", IMPLEMENTED_UNVERIFIED),
+    ("vision", "Vision", "Computer vision", "Last resort for what every other layer missed.", NOT_IMPLEMENTED),
     ("network", "Network", "Network clues", "Requests near the action, stripped of query strings, headers and bodies.", VERIFIED),
 )
 LAYER_KEYS = tuple(key for key, *_ in LAYERS)

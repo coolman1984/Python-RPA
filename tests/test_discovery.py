@@ -60,26 +60,69 @@ def test_every_default_detector_answers_even_with_an_empty_context():
 
 
 # --- confidence ranking -----------------------------------------------------------------
+def web(*candidates, **extra):
+    return {"candidates": list(candidates), "kind": extra.pop("kind", "button"), **extra}
+
+
+def candidate(kind, value, attribute="", **extra):
+    return {"kind": kind, "attribute": attribute, "value": value, **extra}
+
+
 @pytest.mark.parametrize("data,expected", [
-    ({"id": "btnSearch", "kind": "button", "unique_selector": True}, 0.95),
-    ({"id": "ctl00_grid_1739284", "kind": "button", "unique_selector": True}, 0.72),
-    ({"testid": "save", "kind": "button", "unique_selector": True}, 0.93),
-    ({"name": "quantity", "unique_name": True, "kind": "field", "unique_selector": True}, 0.88),
-    ({"selector": "form > div:nth-of-type(3) > button", "kind": "button", "unique_selector": True}, 0.62),
-    ({"text": "Save report", "kind": "button", "unique_selector": None}, 0.55),
+    (web(candidate("id", "btnSearch", "id", unique=True)), 0.95),
+    (web(candidate("id", "ctl00_x_1739284", "id", unique=True)), 0.72),
+    (web(candidate("testid", "save", "data-testid", unique=True)), 0.96),
+    (web(candidate("name", "quantity", "name", unique=True)), 0.88),
+    (web(candidate("css", "form > div:nth-of-type(3) > button", unique=True)), 0.45),
+    (web(candidate("text", "Save report")), 0.55),
 ])
 def test_web_confidence_follows_how_stable_the_evidence_is(data, expected):
     assert observe(WebDetector(), data)["confidence"] == expected
 
 
+def test_a_stable_test_id_beats_a_generated_id(tmp_path):
+    """An element can carry both. Stopping at the first id found is how a session-generated
+    identifier ends up chosen over an identifier put there to be depended on."""
+    from smartops_desktop.discovery import rank_locators
+    ranked = rank_locators({"layers": {"web": {"data": web(
+        candidate("id", "ctl00_grid_1739284", "id", unique=True),
+        candidate("testid", "save-report", "data-qa", unique=True))}}})
+    assert ranked[0]["kind"] == "testid" and ranked[0]["confidence"] == 0.96
+    assert ranked[1]["kind"] == "id" and ranked[1]["confidence"] == 0.72
+
+
+def test_a_data_qa_attribute_is_never_written_out_as_data_testid():
+    """Emitting [data-testid=...] for an element that only has data-qa produces a locator that
+    matches nothing at all."""
+    from smartops_desktop.discovery import rank_locators
+    ranked = rank_locators({"layers": {"web": {"data": web(candidate("testid", "save", "data-qa", unique=True))}}})
+    assert ranked[0]["value"] == '[data-qa="save"]'
+
+
+def test_a_dotted_id_becomes_an_attribute_locator_not_a_class_selector():
+    from smartops_desktop.discovery import rank_locators
+    ranked = rank_locators({"layers": {"web": {"data": web(
+        candidate("id", "mainframe.form.btnSearch", "id", unique=True))}}})
+    assert ranked[0]["value"] == '[id="mainframe.form.btnSearch"]'
+
+
+def test_every_locator_is_kept_not_just_the_winner():
+    from smartops_desktop.discovery import rank_locators
+    ranked = rank_locators({"layers": {"web": {"data": web(
+        candidate("role_name", "Save report", role="button"),
+        candidate("css", "button", unique=True),
+        candidate("text", "Save report"))}}})
+    assert [item["kind"] for item in ranked] == ["role_name", "css", "text"]
+
+
 def test_web_evidence_that_matches_several_elements_is_capped():
-    strong = observe(WebDetector(), {"id": "row", "kind": "button", "unique_selector": True})["confidence"]
-    shared = observe(WebDetector(), {"id": "row", "kind": "button", "unique_selector": False})["confidence"]
-    assert shared < strong and shared <= 0.5
+    strong = observe(WebDetector(), web(candidate("id", "row", "id", unique=True)))["confidence"]
+    shared = observe(WebDetector(), web(candidate("id", "row", "id", unique=False)))["confidence"]
+    assert shared < strong and shared <= 0.45
 
 
 def test_web_reports_missing_when_there_is_nothing_to_go_on():
-    assert observe(WebDetector(), {"kind": "text"})["status"] == fp.MISSING
+    assert observe(WebDetector(), {"kind": "text", "candidates": []})["status"] == fp.MISSING
 
 
 def test_nexacro_ranks_a_live_component_above_a_path_above_a_bare_name():
@@ -115,7 +158,7 @@ def test_an_unreachable_element_gets_no_keyboard_route():
 
 def test_ranking_puts_the_strongest_evidence_first_and_ignores_layers_that_missed():
     result = DiscoveryManager([WebDetector(), AnchorDetector(), RelativeDetector()]).discover(DiscoveryContext(page_payload(
-        web={"id": "btnSearch", "kind": "button", "unique_selector": True},
+        web=web(candidate("id", "btnSearch", "id", unique=True)),
         anchor={"text": "Report date", "distance": 40, "side": "above"},
         relative={"container": "form#report", "fraction_x": 0.1, "fraction_y": 0.9})))
     assert [key for key, _ in fp.rank(result)] == ["web", "anchor", "relative"]
@@ -163,7 +206,7 @@ def test_the_real_windows_backend_declines_cleanly_off_windows():
 
 # --- evidence merging -------------------------------------------------------------------
 def test_merging_keeps_page_context_alongside_the_layers():
-    payload = {**page_payload(web={"id": "qty", "kind": "field", "unique_selector": True}),
+    payload = {**page_payload(web=web(candidate("id", "qty", "id", unique=True), kind="field")),
                "source": "https://example.org/report", "page_title": "Daily report"}
     result = DiscoveryManager([WebDetector()]).discover(DiscoveryContext(payload))
     assert result["source"] == "https://example.org/report"
@@ -190,7 +233,7 @@ def test_the_picture_is_taken_before_the_detectors_that_read_pictures(tmp_path):
 
 
 def test_a_fingerprint_never_carries_field_contents():
-    payload = page_payload(web={"id": "pwd", "kind": "field", "sensitive": True, "text": "", "unique_selector": True})
+    payload = page_payload(web=web(candidate("id", "pwd", "id", unique=True), kind="field", sensitive=True))
     result = DiscoveryManager([WebDetector()]).discover(DiscoveryContext(payload))
     body = repr(result)
     assert result["layers"]["web"]["data"]["sensitive"] is True
@@ -199,7 +242,7 @@ def test_a_fingerprint_never_carries_field_contents():
 
 def test_the_diagnostic_reads_one_line_per_layer():
     result = DiscoveryManager([WebDetector(), WindowsUiaDetector()]).discover(DiscoveryContext(page_payload(
-        web={"id": "btnSearch", "kind": "button", "unique_selector": True})))
+        web=web(candidate("id", "btnSearch", "id", unique=True)))))
     lines = fp.diagnostic(result)
     assert len(lines) == len(fp.LAYER_KEYS)
     assert lines[0].startswith("Web") and lines[0].endswith("✅ 0.95")

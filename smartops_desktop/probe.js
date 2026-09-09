@@ -73,18 +73,31 @@
   const implicitRole = el => attr(el, 'role') || ({BUTTON: 'button', SELECT: 'combobox', TEXTAREA: 'textbox'}[el.tagName])
     || (el.tagName === 'A' && el.hasAttribute('href') ? 'link' : '')
     || (el.tagName === 'INPUT' ? ({checkbox: 'checkbox', radio: 'radio', submit: 'button', button: 'button', reset: 'button'}[el.type] || 'textbox') : '');
+  // Facts only. Confidence and ranking are decided in Python, where they can be tested without
+  // a browser, and where one rule set serves the recorder, the radar and any future replayer.
   const candidates = el => {
     const out = [];
-    const add = (kind, value, confidence) => { if (value && !out.some(x => x.value === value)) out.push({kind, value, confidence}); };
-    if (el.id) add('id', byId(el), 0.98);
-    const tid = attr(el, 'data-testid') || attr(el, 'data-test') || attr(el, 'data-qa');
-    if (tid) add('testid', '[data-testid="' + esc(tid) + '"]', 0.96);
+    const add = (kind, attribute, value, extra) => {
+      if (value) out.push(Object.assign({kind, attribute: attribute || '', value: String(value).slice(0, 300)}, extra || {}));
+    };
+    if (el.id) add('id', 'id', el.id, {unique: unique(byId(el))});
+    for (const name of ['data-testid', 'data-test', 'data-qa', 'data-cy']) {
+      // Keep the attribute that actually exists; emitting [data-testid=...] for a data-qa element
+      // produces a locator that matches nothing.
+      if (attr(el, name)) add('testid', name, attr(el, name), {unique: unique('[' + name + '="' + esc(attr(el, name)) + '"]')});
+    }
     const role = implicitRole(el), named = accessibleName(el);
-    if (role && named) add('role_name', 'role=' + role + '[name="' + esc(named) + '"]', 0.94);
-    if (el.name && document.querySelectorAll('[name="' + CSS.escape(el.name) + '"]').length === 1) add('name', '[name="' + esc(el.name) + '"]', 0.88);
-    if (attr(el, 'placeholder')) add('placeholder', '[placeholder="' + esc(attr(el, 'placeholder')) + '"]', 0.82);
-    add('structural', cssPath(el), 0.45);
-    return out.sort((a, b) => b.confidence - a.confidence);
+    if (role && named) add('role_name', '', named, {role});
+    if (el.id) {
+      const bound = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (bound && text(bound)) add('label', '', text(bound));
+    }
+    if (el.name) add('name', 'name', el.name, {unique: document.querySelectorAll('[name="' + CSS.escape(el.name) + '"]').length === 1});
+    if (attr(el, 'placeholder')) add('placeholder', 'placeholder', attr(el, 'placeholder'));
+    if (attr(el, 'title')) add('title', 'title', attr(el, 'title'));
+    if (text(el) && text(el).length <= 80) add('text', '', text(el));
+    add('css', '', cssPath(el), {unique: unique(cssPath(el))});
+    return out;
   };
 
   // --- Layer: web ------------------------------------------------------------------------

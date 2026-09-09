@@ -124,6 +124,9 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
             last_file = candidate
             validated = True
             output.put({"type": "validation", "path": str(candidate), "result": result, "message": f"Validation passed: {result['rows']} data rows in {result['sheet']}."})
+        elif action in {"desktop_click", "desktop_press"}:
+            raise ValueError(f"Step {number+1} is a desktop interaction. SmartOps records these for "
+                             "review but does not replay desktop applications yet.")
         elif action == "secure_input":
             # Never claim a run passed when a human still has to type the secret.
             raise ValueError(f"Step {number+1} needs a password or code typed by hand. "
@@ -175,7 +178,7 @@ def worker_main(mode, workflow, settings, run_dir, page_url, output, stop, targe
         if mode == "replay" and not workflow.get("steps"):
             raise ValueError("Add or record at least one step before running.")
         # secure_input is refused outright, so there is no point connecting to Chrome to say so.
-        offline_actions = {"demo_export", "validate_xlsx", "wait", "secure_input"}
+        offline_actions = {"demo_export", "validate_xlsx", "wait", "secure_input", "desktop_click", "desktop_press"}
         browser_needed = mode in {"tabs", "record", "inspect"} or any(
             s.get("action") not in offline_actions for s in workflow.get("steps", []))
         if browser_needed:

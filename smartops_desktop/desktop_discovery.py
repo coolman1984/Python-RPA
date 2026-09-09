@@ -182,27 +182,17 @@ class DesktopInputRecorder:
         timer.daemon = True; self._timers.append(timer); timer.start()
 
     def _emit_click(self, x, y, button):
+        """Raw physical input only.
+
+        This used to probe UI Automation and take a screenshot here, which the session then threw
+        away before running the very same discovery again: two lookups, two screenshots, and two
+        answers that could disagree. Enrichment now belongs to the DiscoveryManager alone.
+        """
         if self.stop_event.is_set() or self._is_browser_duplicate(x, y):
             return
         self._sequence += 1
-        probe = probe_windows_at(x, y, self.artifact_dir, self._sequence)
-        uia = probe.get("windows_uia", {})
-        if uia.get("sensitive") or uia.get("reason") == "sensitive_target":
-            return
-        evidence = [
-            {"layer": "windows_uia", "available": bool(uia.get("available")), "confidence": 0.9 if uia.get("available") else 0,
-             "identity": {k:v for k,v in uia.items() if k not in {"available", "sensitive"}}, "reason": "" if uia.get("available") else uia.get("reason", "unavailable")},
-            {"layer": "relative_position", "available": True, "confidence": 0.3,
-             "identity": {"screen_x": int(x), "screen_y": int(y), "button": button}},
-        ]
-        if uia.get("anchors"):
-            evidence.append({"layer": "anchor", "available": True, "confidence": 0.6, "identity": {"neighbors": uia["anchors"]}})
-        visual = probe.get("visual", {})
-        if visual:
-            evidence.append({"layer": "visual", "available": bool(visual.get("available")), "confidence": 0.45 if visual.get("available") else 0,
-                             "identity": {k:v for k,v in visual.items() if k != "available"}, "reason": visual.get("reason", "")})
-        label = uia.get("name") or uia.get("control_type") or "Desktop click"
-        self.callback({"action": "desktop_click", "label": _text(label, 120), "evidence": evidence})
+        self.callback({"action": "desktop_click", "x": int(x), "y": int(y), "button": str(button),
+                       "sequence": self._sequence, "at": time.monotonic(), "source": "desktop"})
 
     def _on_key(self, key, *args):
         if self.stop_event.is_set():
@@ -216,8 +206,9 @@ class DesktopInputRecorder:
     def _emit_key(self, name):
         if self.stop_event.is_set() or self._is_browser_key_duplicate(name):
             return
-        self.callback({"action": "desktop_press", "label": f"Press {name}", "value": name,
-                       "evidence": [{"layer": "keyboard", "available": True, "confidence": 1.0, "identity": {"key": name}}]})
+        self._sequence += 1
+        self.callback({"action": "desktop_press", "value": name, "label": f"Press {name}",
+                       "sequence": self._sequence, "at": time.monotonic(), "source": "desktop"})
 
     def stop(self):
         for listener in (self._mouse, self._keyboard):

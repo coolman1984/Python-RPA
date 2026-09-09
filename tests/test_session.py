@@ -34,7 +34,22 @@ IFRAME = """<h2>Outer page</h2>
 NESTED = """<iframe id="outerFrame" style="width:500px;height:300px" srcdoc="
   &lt;iframe id='innerFrame' style='width:400px;height:200px' srcdoc=&quot;&lt;button id='deep'&gt;Deep button&lt;/button&gt;&quot;&gt;&lt;/iframe&gt;"></iframe>"""
 
+NESTED_COLOURED = """<div style="height:80px"></div>
+<iframe id="outerFrame" style="width:500px;height:300px;border:0" srcdoc="
+  &lt;body style='margin:0'&gt;&lt;div style='height:60px'&gt;&lt;/div&gt;
+  &lt;iframe id='innerFrame' style='width:400px;height:200px;border:0' srcdoc=&quot;&lt;body style='margin:0'&gt;&lt;div style='height:40px'&gt;&lt;/div&gt;&lt;button id='deep' style='width:160px;height:44px;background:#ff0000;border:0;color:#ff0000'&gt;X&lt;/button&gt;&lt;/body&gt;&quot;&gt;&lt;/iframe&gt;&lt;/body&gt;"></iframe>"""
+
 POPUP = """<a id="opener" href="about:blank" target="_blank">Open a second tab</a>"""
+
+
+def timeline(session, seconds=2.0):
+    """The materialised, enriched steps.
+
+    Raw capture is instant and lands in the journal immediately; discovery patches it afterwards,
+    so evidence is read from the journal's timeline rather than from the raw return of pump().
+    """
+    session.pump(seconds)
+    return [step for step in session.journal.steps() if step.get("origin") != "start_context"]
 
 
 # --- state machine, no browser needed -----------------------------------------------------
@@ -56,19 +71,50 @@ def test_every_state_can_reach_a_safe_end(tmp_path):
 # --- draft journal, no browser needed -----------------------------------------------------
 def test_a_step_is_on_disk_the_moment_it_is_accepted(tmp_path):
     journal = DraftJournal(tmp_path, target={"title": "Report"})
-    journal.append({"action": "click", "label": "Save"})
+    journal.add("s0001", {"action": "click", "label": "Save"})
     assert json.loads((tmp_path / "draft.json").read_text())["steps"] == 1
     assert len(journal.steps()) == 1
 
 
+def test_evidence_arrives_later_as_a_separate_operation_and_never_rewrites_the_step(tmp_path):
+    """The user's action must be durable before any slow detector runs."""
+    journal = DraftJournal(tmp_path)
+    journal.add("s0001", {"action": "click", "label": "Save", "enriched": False})
+    raw_only = journal.steps()[0]
+    assert raw_only["enriched"] is False and "fingerprint" not in raw_only
+    journal.enrich("s0001", {"enriched": True, "fingerprint": {"schema_version": 2}, "selector": "#save"})
+    enriched = journal.steps()[0]
+    assert enriched["enriched"] is True and enriched["selector"] == "#save"
+    assert enriched["label"] == "Save", "enrichment adds; it does not overwrite what was recorded"
+    operations = [entry["op"] for entry in journal.operations()]
+    assert operations == ["add", "enrich"], "append-only: nothing is rewritten in place"
+
+
+def test_a_crash_before_enrichment_still_keeps_the_users_action(tmp_path):
+    journal = DraftJournal(tmp_path)
+    journal.add("s0001", {"action": "fill", "label": "Quantity", "value": "120", "enriched": False})
+    reopened = DraftJournal(tmp_path, session_id=journal.session_id)
+    reopened.log_path = journal.log_path
+    recovered = reopened.steps()
+    assert len(recovered) == 1 and recovered[0]["value"] == "120"
+
+
+def test_undo_and_edit_are_operations_that_survive_a_crash(tmp_path):
+    journal = DraftJournal(tmp_path)
+    journal.add("s0001", {"action": "click", "label": "One"})
+    journal.add("s0002", {"action": "click", "label": "Two"})
+    journal.undo("s0002")
+    journal.edit("s0001", {"label": "Renamed"})
+    assert [step["label"] for step in journal.steps()] == ["Renamed"]
+
+
 def test_a_draft_truncated_by_a_crash_keeps_everything_before_the_break(tmp_path):
     journal = DraftJournal(tmp_path)
-    journal.append({"action": "click", "label": "One"})
-    journal.append({"action": "fill", "label": "Two"})
+    journal.add("s0001", {"action": "click", "label": "One"})
+    journal.add("s0002", {"action": "fill", "label": "Two"})
     with (tmp_path / "draft.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write('{"action": "click", "lab')  # power cut mid-write
-    recovered = journal.steps()
-    assert [step["label"] for step in recovered] == ["One", "Two"]
+        stream.write('{"op": "add", "step_id": "s0003", "ste')  # power cut mid-write
+    assert [step["label"] for step in journal.steps()] == ["One", "Two"]
 
 
 def test_an_unfinished_recording_is_offered_back_and_a_saved_one_is_not(tmp_path):
@@ -79,6 +125,18 @@ def test_an_unfinished_recording_is_offered_back_and_a_saved_one_is_not(tmp_path
     offered = DraftJournal.unfinished(tmp_path)
     assert [item["session_id"] for item in offered] == [crashed.session_id]
     assert offered[0]["folder"].endswith("run-a")
+
+
+def test_a_radar_session_is_never_offered_back_as_a_lost_automation(tmp_path):
+    """Radar fingerprints are diagnostics. Offering them as unfinished recordings would invite the
+    user to save a workflow they never recorded."""
+    from smartops_desktop.session import RADAR_KIND
+    radar = DraftJournal(tmp_path / "radar-run", kind=RADAR_KIND)
+    radar.note(state=RECORDING)
+    recording = DraftJournal(tmp_path / "record-run")
+    recording.note(state=RECORDING)
+    offered = DraftJournal.unfinished(tmp_path)
+    assert [item["session_id"] for item in offered] == [recording.session_id]
 
 
 # --- the browser paths --------------------------------------------------------------------
@@ -118,8 +176,7 @@ def test_recording_uses_the_same_discovery_manager_as_the_radar(recorder):
     session, page = recorder(FORM, manager=manager)
     assert session.manager is manager
     page.click("#save")
-    page.wait_for_timeout(250)
-    steps = session.drain()
+    steps = timeline(session)
     assert len(steps) == 1
     # A recorded step carries BOTH the replayable action and the full fingerprint.
     assert steps[0]["action"] == "click" and steps[0]["selector"]
@@ -162,7 +219,7 @@ def test_a_password_field_records_its_identity_and_never_its_value(recorder):
     page.fill("#secret", "hunter2")
     page.click("h2")
     page.wait_for_timeout(300)
-    steps = session.drain()
+    steps = session.pump(1.2)
     secure = [step for step in steps if step.get("secure")]
     assert secure, "the control must still be recorded, just without its value"
     assert secure[0]["label"] == "Manual secure input required"
@@ -174,8 +231,7 @@ def test_a_password_field_records_its_identity_and_never_its_value(recorder):
 def test_events_inside_an_iframe_are_recorded_not_discarded(recorder):
     session, page = recorder(IFRAME)
     page.frame_locator("#reportFrame").locator("#inner").click()
-    page.wait_for_timeout(300)
-    steps = session.drain()
+    steps = timeline(session)
     assert len(steps) == 1
     frame_layer = steps[0]["fingerprint"]["layers"]["frame"]
     assert frame_layer["data"]["top_level"] is False
@@ -186,8 +242,7 @@ def test_events_inside_an_iframe_are_recorded_not_discarded(recorder):
 def test_events_inside_a_nested_iframe_are_recorded_with_their_depth(recorder):
     session, page = recorder(NESTED)
     page.frame_locator("#outerFrame").frame_locator("#innerFrame").locator("#deep").click()
-    page.wait_for_timeout(300)
-    steps = session.drain()
+    steps = timeline(session)
     assert len(steps) == 1
     assert steps[0]["fingerprint"]["layers"]["frame"]["data"]["depth"] == 2
 
@@ -198,8 +253,7 @@ def test_the_element_picture_really_shows_the_element_inside_an_iframe(recorder)
     wrong area. The button is pure red, so the pixels prove which element was captured."""
     session, page = recorder(IFRAME)
     page.frame_locator("#reportFrame").locator("#inner").click()
-    page.wait_for_timeout(300)
-    steps = session.drain()
+    steps = timeline(session)
     picture = steps[0]["fingerprint"]["layers"]["visual"]["data"]["element_png"]
     with open(picture, "rb") as handle:
         raw = handle.read()
@@ -217,7 +271,7 @@ def test_no_probe_marker_is_left_behind_in_any_frame(recorder):
     session, page = recorder(IFRAME)
     page.frame_locator("#reportFrame").locator("#inner").click()
     page.wait_for_timeout(300)
-    session.drain()
+    session.pump(1.5)
     for frame in page.frames:
         left = frame.evaluate("document.querySelectorAll('[data-smartops-probe]').length")
         assert left == 0, f"a marker was left in {frame.url or 'a frame'}"
@@ -253,7 +307,7 @@ def test_pause_stops_capturing_and_resume_starts_again(recorder):
     session.pause()
     page.click("#save")
     page.wait_for_timeout(250)
-    assert session.drain() == []
+    assert session.pump(1.0) == []
     session.resume()
     page.click("#save")
     page.wait_for_timeout(250)
@@ -272,8 +326,7 @@ def test_one_failing_detector_never_stops_a_recording(recorder):
     manager = DiscoveryManager([Sabotage()] + [d for d in DEFAULT_DETECTORS if d.key != "web"])
     session, page = recorder(FORM, manager=manager)
     page.click("#save")
-    page.wait_for_timeout(250)
-    steps = session.drain()
+    steps = timeline(session)
     assert len(steps) == 1, "the step must still be recorded"
     assert steps[0]["fingerprint"]["layers"]["web"]["status"] == fp.FAILED
     assert steps[0]["fingerprint"]["layers"]["anchor"]["status"] == fp.FOUND
@@ -285,11 +338,11 @@ def test_ten_consecutive_recordings_of_the_same_action_agree(recorder):
     seen = []
     for _ in range(10):
         page.click("#save")
-        page.wait_for_timeout(180)
-        steps = session.drain()
-        assert len(steps) == 1
-        web = steps[0]["fingerprint"]["layers"]["web"]
-        seen.append((steps[0]["action"], steps[0]["selector"], web["confidence"], steps[0]["best_layer"]))
+        steps = timeline(session, 1.2)
+        assert len(steps) == len(seen) + 1
+        latest = steps[-1]
+        web = latest["fingerprint"]["layers"]["web"]
+        seen.append((latest["action"], latest["selector"], web["confidence"], latest["best_layer"]))
     assert len(set(seen)) == 1, f"recordings drifted: {set(seen)}"
 
 
@@ -464,14 +517,35 @@ def test_native_capture_reports_unavailable_rather_than_pretending(tmp_path):
 
 def test_a_native_interaction_enters_the_same_pipeline_as_a_browser_one(tmp_path):
     session = RecordingSession(None, tmp_path, queue.Queue(), mode="record")
-    session.native_step({"action": "desktop_click", "x": 640, "y": 480, "label": "OK"})
-    assert len(session.pending) == 1
-    queued = session.pending[0]
-    assert queued["native"] is True and queued["frame"] is None
-    assert queued["payload"]["screen"] == {"x": 640, "y": 480}
-    steps = session.drain()
+    session.journal = DraftJournal(tmp_path)
+    session.native_step({"action": "desktop_click", "x": 640, "y": 480, "button": "left", "sequence": 1})
+    steps = session.pump(1.2)
     assert len(steps) == 1 and steps[0]["action"] == "desktop_click"
-    assert set(steps[0]["fingerprint"]["layers"]) == set(fp.LAYER_KEYS)
+    assert steps[0]["source"] == "desktop" and steps[0]["enriched"] is False
+    assert session.journal.steps()[0]["action"] == "desktop_click"
+
+
+def test_a_native_key_keeps_its_keyboard_evidence(tmp_path):
+    """The raw hook no longer probes Windows itself, so its keyboard evidence must reach the
+    manager rather than being thrown away with the rest of the old duplicate probe."""
+    session = RecordingSession(None, tmp_path, queue.Queue(), mode="record")
+    session.native_step({"action": "desktop_press", "value": "enter", "sequence": 2})
+    queued = session.pending.get_nowait()
+    keyboard = queued["payload"]["layers"]["keyboard"]
+    assert keyboard["status"] == fp.FOUND and keyboard["data"]["key"] == "enter"
+
+
+def test_the_native_hook_reports_raw_input_only(tmp_path, monkeypatch):
+    """It used to probe UIA and screenshot here, then the session discovered everything again."""
+    import smartops_desktop.desktop_discovery as dd
+    called = []
+    monkeypatch.setattr(dd, "probe_windows_at", lambda *a, **k: called.append(a) or {})
+    sent = []
+    recorder = dd.DesktopInputRecorder(sent.append, __import__("threading").Event(), tmp_path)
+    recorder._emit_click(120, 340, "left")
+    assert called == [], "the hook must not run discovery of its own"
+    assert sent[0]["action"] == "desktop_click" and sent[0]["x"] == 120
+    assert "evidence" not in sent[0]
 
 
 def test_a_browser_click_marks_itself_so_the_native_hook_cannot_double_count_it(tmp_path):
@@ -495,8 +569,7 @@ def test_a_nested_frame_step_keeps_the_entire_route_not_just_the_last_hop(record
     from smartops_desktop.core import Store
     session, page = recorder(NESTED)
     page.frame_locator("#outerFrame").frame_locator("#innerFrame").locator("#deep").click()
-    page.wait_for_timeout(300)
-    step = session.drain()[0]
+    step = timeline(session)[0]
     assert step["frame_depth"] == 2
     assert len(step["frame_chain"]) == 2 and step["frame"] == step["frame_chain"][-1]
     # and it must survive save, reload and an edit
@@ -505,3 +578,79 @@ def test_a_nested_frame_step_keeps_the_entire_route_not_just_the_last_hop(record
     reloaded = next(w for w in store.list_workflows() if w["id"] == saved["id"])["steps"][0]
     assert reloaded["frame_chain"] == step["frame_chain"]
     store.db.close()
+
+
+# --- A18: recording must never wait for discovery ------------------------------------------
+@browser_only
+def test_a_slow_detector_never_delays_the_recorded_step(recorder, tmp_path):
+    """The whole point of deferring enrichment: a screenshot or a UIA lookup must not sit between
+    the user's click and the step reaching disk."""
+    import time as _time
+    from smartops_desktop.discovery import DEFAULT_DETECTORS, Detector
+
+    class Slow(Detector):
+        key = "visual"
+
+        def observe(self, context):
+            _time.sleep(0.6)
+            return fp.observation(self.key, fp.FOUND, "slow but done", 0.65)
+
+    manager = DiscoveryManager([Slow()] + [d for d in DEFAULT_DETECTORS if d.key != "visual"])
+    session, page = recorder(FORM, manager=manager)
+    page.click("#save")
+    page.wait_for_timeout(250)
+    started = _time.monotonic()
+    steps = session.drain()          # capture only
+    elapsed = _time.monotonic() - started
+    assert len(steps) == 1
+    assert elapsed < 0.3, f"capture waited {elapsed:.2f}s on a detector it should not wait for"
+    assert steps[0]["enriched"] is False
+    recorded = [x for x in session.journal.steps() if x.get("origin") != "start_context"]
+    assert recorded[0]["action"] == "click", "the action is durable before enrichment runs"
+    assert recorded[0]["enriched"] is False
+    session.enrich(budget=1)
+    recorded = [x for x in session.journal.steps() if x.get("origin") != "start_context"]
+    assert recorded[0]["enriched"] is True and "fingerprint" in recorded[0]
+
+
+@browser_only
+def test_enrichment_arrives_as_a_patch_and_carries_ranked_locators(recorder):
+    session, page = recorder(FORM)
+    page.click("#save")
+    step = timeline(session)[0]
+    assert step["enriched"] is True
+    assert step["locators"] and step["locators"][0]["kind"] == "id"
+    assert step["primary_locator"]["value"] == "#save"
+    assert step["selector"] == "#save"
+
+
+@browser_only
+def test_a_step_records_which_logical_page_it_happened_on(recorder):
+    session, page = recorder(POPUP)
+    with page.expect_popup() as pending:
+        page.click("#opener")
+    popup = pending.value
+    popup.set_content("<button id='inPopup'>Continue</button>")
+    session.pump(1.2)
+    popup.click("#inPopup")
+    steps = session.pump(1.2)
+    contexts = [step["page_context"] for step in steps]
+    assert contexts[-1]["logical_page_id"] == "popup-1"
+    assert contexts[-1]["relation"] == "popup"
+    assert contexts[-1]["opener_page_id"] == "page-1"
+    popup.close()
+
+
+@browser_only
+def test_the_context_picture_of_a_nested_iframe_element_shows_the_element(recorder):
+    """Playwright already reports main-frame coordinates. Adding frame offsets to them
+    double-counts, so the surrounding shot landed somewhere else entirely."""
+    session, page = recorder(NESTED_COLOURED)
+    page.frame_locator("#outerFrame").frame_locator("#innerFrame").locator("#deep").click()
+    visual = timeline(session, 2.5)[0]["fingerprint"]["layers"]["visual"]["data"]
+    from PIL import Image
+    for name, floor in (("element_png", 0.9), ("context_png", 0.05)):
+        image = Image.open(visual[name]).convert("RGB")
+        total = image.size[0] * image.size[1]
+        red = sum(count for count, (r, g, b) in (image.getcolors(maxcolors=total) or []) if r > 200 and g < 60 and b < 60)
+        assert red / total > floor, f"{name} does not contain the target ({red}/{total} red)"

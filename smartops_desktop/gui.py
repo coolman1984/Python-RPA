@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 
 from . import fingerprint as fp
 from .core import Store, ACTIONS, validate_workflow, atomic_text, http_url
+from .session import SAVED, DISCARDED, RecordingSession
 from .worker import worker_main
 
 STYLE = """
@@ -681,6 +682,9 @@ class MainWindow(QMainWindow):
             else:
                 try:
                     flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download.", "steps": self.captured})
+                    # Only now, with the workflow really on disk, may the draft stop being offered
+                    # back. A failed save above leaves it recoverable, which is the point.
+                    RecordingSession.close_draft(self.run_dir, SAVED)
                     self.current = None
                     self.reload_workflows(flow["id"])
                 except Exception as exc:
@@ -718,8 +722,9 @@ class MainWindow(QMainWindow):
         if not ok: return
         try:
             http_url(url)
-            helper = Path(self.store.settings()["chrome_launcher"])
-            if not helper.is_file(): raise ValueError("Approved Chrome launcher not found. Set its path in Settings.")
+            from .core import chrome_launcher
+            helper = chrome_launcher(self.store.settings())
+            if not helper.is_file(): raise ValueError("No approved Chrome helper was found. Point Settings at one, or place open_chrome.py beside SmartOps.")
             process = QProcess(self)
             if getattr(sys, "frozen", False):
                 process.setProgram(sys.executable)

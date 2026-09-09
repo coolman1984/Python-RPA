@@ -36,6 +36,63 @@ def short_error(exc):
     return f"{type(exc).__name__}: {first}"[:300]
 
 
+# How much a kind of evidence is worth, before uniqueness and shape are taken into account.
+# A stable id is excellent; a generated one is not, and must not beat a purpose-built test id
+# simply because it happens to be an id.
+LOCATOR_KINDS = {
+    "testid":    {"base": 0.96, "selector": lambda c: f'[{c["attribute"]}="{_escape(c["value"])}"]'},
+    "role_name": {"base": 0.94, "selector": lambda c: f'role={c.get("role", "")}[name="{_escape(c["value"])}"]'},
+    "id":        {"base": 0.95, "selector": lambda c: _by_id(c["value"])},
+    "label":     {"base": 0.90, "selector": lambda c: f'label={_escape(c["value"])}'},
+    "name":      {"base": 0.88, "selector": lambda c: f'[name="{_escape(c["value"])}"]'},
+    "placeholder": {"base": 0.82, "selector": lambda c: f'[placeholder="{_escape(c["value"])}"]'},
+    "title":     {"base": 0.70, "selector": lambda c: f'[title="{_escape(c["value"])}"]'},
+    "text":      {"base": 0.55, "selector": lambda c: f'text={_escape(c["value"])}'},
+    "css":       {"base": 0.60, "selector": lambda c: c["value"]},
+}
+
+
+def _escape(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _by_id(value):
+    return "#" + value if re.fullmatch(r"[A-Za-z_][\w-]*", str(value)) else f'[id="{_escape(value)}"]'
+
+
+def score_locator(candidate):
+    """One rule set for every caller. Returns (confidence, selector) or None."""
+    rule = LOCATOR_KINDS.get(candidate.get("kind"))
+    if rule is None or not candidate.get("value"):
+        return None
+    confidence = rule["base"]
+    if candidate["kind"] == "id" and GENERATED_ID.search(str(candidate["value"])):
+        confidence = 0.72                      # rebuilt per session or per build
+    if candidate["kind"] == "css" and POSITIONAL_SELECTOR.search(str(candidate["value"])):
+        confidence = 0.45                      # breaks when a row is inserted
+    if candidate.get("unique") is False:
+        confidence = min(confidence, 0.45)     # matches more than one element
+    return confidence, rule["selector"](candidate)
+
+
+def rank_locators(fingerprint):
+    """Every way of addressing the element, strongest first. Never one CSS string."""
+    web = ((fingerprint.get("layers") or {}).get("web") or {}).get("data") or {}
+    ranked = []
+    for candidate in web.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        scored = score_locator(candidate)
+        if scored is None:
+            continue
+        confidence, selector = scored
+        ranked.append({"kind": candidate["kind"], "attribute": candidate.get("attribute", ""),
+                       "value": selector, "raw": candidate.get("value", ""),
+                       "confidence": round(confidence, 2), "unique": candidate.get("unique")})
+    ranked.sort(key=lambda item: -item["confidence"])
+    return ranked
+
+
 class DiscoveryContext:
     """Everything the detectors may look at for one pointed-at element."""
 
@@ -94,25 +151,16 @@ class WebDetector(PageEvidenceDetector):
     key = "web"
 
     def judge(self, data, detail):
-        identifier, unique = data.get("id", ""), data.get("unique_selector")
-        if identifier:
-            confidence = 0.72 if GENERATED_ID.search(identifier) else 0.95
-            how = f"id {identifier}" + (" (looks generated)" if confidence < 0.9 else "")
-        elif data.get("testid"):
-            confidence, how = 0.93, f"test id {data['testid']}"
-        elif data.get("name") and data.get("unique_name"):
-            confidence, how = 0.88, f"name {data['name']}"
-        elif data.get("selector") and unique:
-            positional = bool(POSITIONAL_SELECTOR.search(data["selector"]))
-            confidence, how = (0.62 if positional else 0.80), ("position in the page" if positional else "a unique selector")
-        elif data.get("text"):
-            confidence, how = 0.55, f'the text "{data["text"]}"'
-        else:
+        ranked = rank_locators({"layers": {"web": {"data": data}}})
+        if not ranked:
             return None
-        if unique is False:
-            confidence = min(confidence, 0.5)
+        best = ranked[0]
+        how = f'{best["kind"]} {best["raw"]}'.strip()
+        if best["kind"] == "id" and best["confidence"] < 0.9:
+            how += " (looks generated)"
+        if best.get("unique") is False:
             how += " (not unique on this page)"
-        return confidence, f"{data.get('kind', 'element')} · {how}"
+        return best["confidence"], f'{data.get("kind", "element")} · {how}'
 
 
 # --- 2. frame and tab context -----------------------------------------------------------
@@ -291,27 +339,6 @@ class AnchorDetector(PageEvidenceDetector):
 
 
 # --- 7. visual fingerprint --------------------------------------------------------------
-def frame_offset(frame):
-    """Where a frame's viewport sits inside the top-level page, walking up nested iframes."""
-    left = top = 0.0
-    current = frame
-    while current is not None:
-        try:
-            parent = current.parent_frame
-        except Exception:
-            parent = None
-        if parent is None:
-            break
-        try:
-            box = current.frame_element().bounding_box() or {}
-        except Exception:
-            box = {}
-        left += float(box.get("x", 0) or 0)
-        top += float(box.get("y", 0) or 0)
-        current = parent
-    return left, top
-
-
 class VisualDetector(Detector):
     """A picture of the element, taken through the element itself.
 
@@ -346,7 +373,7 @@ class VisualDetector(Detector):
         digest = hashlib.sha256(element_png.read_bytes()).hexdigest()
         data = {"element_png": str(element_png), "sha256": digest, "box": box}
 
-        surroundings = self.surroundings(context, page, box)
+        surroundings = self.surroundings(context, page, box, target)
         if surroundings:
             data["context_png"] = str(surroundings)
         if not isinstance(box, dict) or not (box.get("width") and box.get("height")):
@@ -361,14 +388,26 @@ class VisualDetector(Detector):
                 confidence, note = 0.65, ""
         return fp.observation(self.key, fp.FOUND, f"{box['width']}x{box['height']} pixels{note}.", confidence, **data)
 
-    def surroundings(self, context, page, box):
-        """The area around the element, in top-level coordinates so nested frames land correctly."""
-        if not isinstance(box, dict) or not (box.get("width") and box.get("height")):
+    def surroundings(self, context, page, box, target=None):
+        """The area around the element, in main-frame coordinates.
+
+        Playwright's locator bounding box is ALREADY relative to the main-frame viewport, even for
+        an element inside nested iframes. Adding frame offsets to it double-counts them, so the
+        locator's own box is used and the probe's frame-relative box is only a fallback.
+        """
+        placed = None
+        if target is not None:
+            try:
+                placed = target.bounding_box()
+            except Exception:
+                placed = None
+        placed = placed or (box if isinstance(box, dict) else None)
+        if not placed or not (placed.get("width") and placed.get("height")):
             return None
-        offset_x, offset_y = frame_offset(context.frame) if context.frame is not None else (0.0, 0.0)
         size = page.viewport_size or {"width": 1920, "height": 1080}
-        left = max(0, int(box["x"] + offset_x) - self.padding)
-        top = max(0, int(box["y"] + offset_y) - self.padding)
+        left = max(0, int(placed["x"]) - self.padding)
+        top = max(0, int(placed["y"]) - self.padding)
+        box = placed
         clip = {"x": left, "y": top,
                 "width": max(1, min(box["width"] + self.padding * 2, size["width"] - left)),
                 "height": max(1, min(box["height"] + self.padding * 2, size["height"] - top))}
@@ -452,25 +491,18 @@ def vision_backend():
 
 
 class VisionDetector(Detector):
-    """Last resort: a template descriptor of the element, for when nothing else identifies it."""
+    """Reserved slot. Deliberately not implemented.
+
+    Keeping a PNG and reading its dimensions is not visual matching, and a SHA-256 proves file
+    integrity, not that an element was found. Until a real template or feature matcher exists and
+    is tested against small layout and rendering changes, this reports NOT_IMPLEMENTED rather than
+    a green tick over a stored image.
+    """
     key = "vision"
 
-    def __init__(self, backend=vision_backend):
-        self.backend = backend
-
     def observe(self, context):
-        module, reason = self.backend()
-        if module is None:
-            return fp.observation(self.key, fp.UNAVAILABLE, reason)
-        picture = (context.payload.get("visual") or {}).get("element_png", "")
-        if not picture or not Path(picture).is_file():
-            return fp.observation(self.key, fp.UNAVAILABLE, "No picture was captured for this element to describe.")
-        image = module.imread(picture)
-        if image is None:
-            return fp.observation(self.key, fp.MISSING, "The stored picture could not be read back.")
-        height, width = image.shape[:2]
-        return fp.observation(self.key, fp.FOUND, f"template {width}x{height} kept for matching", 0.50,
-                              template=picture, width=int(width), height=int(height))
+        return fp.observation(self.key, fp.UNAVAILABLE,
+                              "No visual matcher is implemented yet; the stored picture is evidence, not a matcher.")
 
 
 def safe_http_url(value):
