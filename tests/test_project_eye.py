@@ -193,16 +193,39 @@ def test_a_machine_specific_path_reappearing_is_caught(sandbox):
 
 # --- stale proof detection --------------------------------------------------------------------
 def test_a_proof_goes_stale_when_the_code_behind_it_moves(sandbox):
-    """Evidence is only as fresh as the code it was gathered from."""
-    revision = sandbox / ".project-eye" / "revision.json"
+    """Evidence is only as fresh as the code it was gathered from.
+
+    Pinned to the parent of the last commit that touched session.py, so the condition is real
+    rather than whatever HEAD~1 happened to contain.
+    """
     import json
+    last = subprocess.run(["git", "log", "-1", "--format=%H", "--", "smartops_desktop/session.py"],
+                          cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    before = subprocess.run(["git", "rev-parse", f"{last}~1"], cwd=ROOT,
+                            capture_output=True, text=True).stdout.strip()
+    assert before, "the repository must have history for this check to mean anything"
+    revision = sandbox / ".project-eye" / "revision.json"
     data = json.loads(revision.read_text(encoding="utf-8"))
-    base = subprocess.run(["git", "rev-parse", "HEAD~1"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    data["verified_at_commit"] = base
+    data["verified_at_commit"] = before
     revision.write_text(json.dumps(data, indent=2), encoding="utf-8")
     shutil.copytree(ROOT / ".git", sandbox / ".git", ignore=shutil.ignore_patterns("objects/pack/tmp*"))
     done = run("doctor", cwd=sandbox)
-    assert "STALE PROOF" in done.stdout or "MAP BEHIND CODE" in done.stdout
+    assert "STALE PROOF" in done.stdout, done.stdout
+    assert "smartops_desktop/session.py" in done.stdout
+
+
+def test_the_tools_own_generated_output_is_not_reported_as_drift(sandbox):
+    """graph.yaml and revision.json are written by the tool. A change there is not the map
+    falling behind the code, and reporting it as such trains people to ignore the report."""
+    import json
+    revision = sandbox / ".project-eye" / "revision.json"
+    data = json.loads(revision.read_text(encoding="utf-8"))
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    data["verified_at_commit"] = head
+    revision.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    shutil.copytree(ROOT / ".git", sandbox / ".git", ignore=shutil.ignore_patterns("objects/pack/tmp*"))
+    done = run("doctor", cwd=sandbox)
+    assert "MAP BEHIND CODE" not in done.stdout, done.stdout
 
 
 def test_a_documented_number_that_drifts_from_the_code_is_caught(sandbox):
