@@ -1,4 +1,4 @@
-generated_from: 811e3085d89d040cde69ee69c48e01a576fc3226
+generated_from: bce775c0ac78fa92a0d20a3e723a3e18f273e775
 imports:
   smartops_desktop/__init__.py: []
   smartops_desktop/core.py: []

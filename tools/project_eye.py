@@ -213,12 +213,13 @@ def check_rules(findings):
 
 
 def stale_proofs():
+    """Proofs whose code moved since the map was verified. The revision pin itself is not code."""
     """A proof is stale when its code changed after the revision the map was verified at."""
     revision = load("revision.json")
     base = revision.get("verified_at_commit")
     if not base:
         return []
-    changed = set(git("diff", "--name-only", f"{base}..HEAD").splitlines())
+    changed = set(git("diff", "--name-only", f"{base}..HEAD").splitlines()) - {".project-eye/revision.json"}
     stale = []
     for proof in load("proofs.yaml").get("proofs") or []:
         touched = sorted(set(proof.get("paths") or []) & changed)
@@ -261,9 +262,14 @@ def cmd_doctor(args):
     print("Project Eye — doctor")
     revision = load("revision.json")
     print(f"  map revision {revision.get('map_revision')} verified at {str(revision.get('verified_at_commit'))[:8]}")
-    behind = git("rev-list", "--count", f"{revision.get('verified_at_commit')}..HEAD") or "0"
-    if behind not in {"", "0"}:
-        print(f"  MAP BEHIND CODE: {behind} commit(s) since the map was last verified")
+    # Pinning the revision necessarily creates a commit. A change that touches only the pin is
+    # not the map falling behind the code, so it is not reported as drift.
+    since = [line for line in git("diff", "--name-only", f"{revision.get('verified_at_commit')}..HEAD").splitlines()
+             if line and line != ".project-eye/revision.json"]
+    if since:
+        print(f"  MAP BEHIND CODE: {len(since)} file(s) changed since the map was last verified")
+        for path in since[:10]:
+            print(f"    {path}")
     stale = stale_proofs()
     for pid, paths in stale:
         print(f"  STALE PROOF: {pid} (changed: {', '.join(paths)})")
@@ -395,4 +401,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.stderr.close()   # the reader went away (piped into head); that is not an error
