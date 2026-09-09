@@ -1,0 +1,6 @@
+{
+  "map_revision": 3,
+  "verified_at_commit": "15af28b751d419d239410f243530cb9aafe6445b",
+  "branch": "fix/recorder-ux-session",
+  "note": "Revision 3: verified at the merge gate \u2014 validate clean, 185 browser tests, self-test green."
+}

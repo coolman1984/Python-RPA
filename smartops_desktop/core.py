@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,16 +15,35 @@ from zipfile import ZipFile, BadZipFile
 import yaml
 from openpyxl import load_workbook
 
-ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export")
+# secure_input is a real, savable step: the recorder saw a credential field and deliberately kept
+# its identity without its value. Replay refuses it out loud rather than pretending it succeeded.
+ACTIONS = ("navigate", "click", "fill", "select", "check", "press", "wait", "download", "validate_xlsx", "nexacro_probe", "demo_export", "secure_input",
+           # Discovery-only for now: recorded and saved so the evidence is never lost, and refused
+           # out loud by replay rather than pretending desktop automation works.
+           "desktop_click", "desktop_press")
 DEFAULT_SETTINGS = {
     "cdp_url": "http://127.0.0.1:9222",
-    "chrome_launcher": r"D:\WORK\Software Development\GitHub\AI CREW\Mandatory To Use Skills\windows-chrome-launcher\scripts\open_chrome.py",
+    # Empty by default: a shipped build must never carry one developer's machine layout. The app
+    # looks beside itself first, and Advanced settings can point at an approved helper.
+    "chrome_launcher": "",
     "timeout_seconds": 30,
 }
 
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def chrome_launcher(settings=None):
+    """The approved Chrome helper: whatever Settings names, else one bundled beside the app."""
+    configured = (settings or {}).get("chrome_launcher", "")
+    if configured:
+        return Path(configured)
+    root = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+    for candidate in (root / "open_chrome.py", root / "scripts" / "open_chrome.py"):
+        if candidate.is_file():
+            return candidate
+    return Path("")
 
 
 def data_root():
@@ -71,11 +91,19 @@ def validate_workflow(raw):
     for index, step in enumerate(raw["steps"], 1):
         if not isinstance(step, dict) or step.get("action") not in ACTIONS:
             raise ValueError(f"Step {index}: unsupported action.")
+        # dict(step) keeps every key the recorder attached: fingerprint, detected_by, capture
+        # metadata. Rebuilding a step from known fields only is how that evidence gets lost.
         item = dict(step)
         action = item["action"]
         if action == "navigate":
             http_url(item.get("url", ""))
-        if action in {"click", "fill", "select", "check", "press", "download"}:
+        if action == "secure_input":
+            if "value" in item:
+                raise ValueError(f"Step {index}: a secure input step must never carry a value.")
+            item["secure"] = True
+        if action in {"desktop_click", "desktop_press"}:
+            item.setdefault("label", "Desktop interaction")
+        if action in {"click", "fill", "select", "check", "press", "download", "secure_input"}:
             if not isinstance(item.get("selector"), str) or not item["selector"].strip():
                 raise ValueError(f"Step {index}: a selector is required.")
         if action in {"fill", "select", "press"} and not isinstance(item.get("value"), str):

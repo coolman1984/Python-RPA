@@ -10,14 +10,17 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QTimer, QProcess
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QStackedWidget, QLineEdit, QTextEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QFileDialog, QMessageBox,
     QInputDialog, QComboBox, QSpinBox, QFormLayout, QDialog, QDialogButtonBox, QCheckBox,
     QProgressBar, QFrame, QSplitter)
 
+from . import fingerprint as fp
 from .core import Store, ACTIONS, validate_workflow, atomic_text, http_url
+from .session import (CAPACITY, DISCARDED, RADAR_KIND, SAVED, SESSION_STATE, STEP_ADDED,
+                      STEP_ENRICHED, DraftJournal, RecordingSession)
 from .worker import worker_main
 
 STYLE = """
@@ -120,8 +123,16 @@ class StepDialog(QDialog):
         self.seconds.setEnabled(action == "wait")
         self.checked.setEnabled(action == "check")
 
+    EDITABLE = ("label", "url", "selector", "value", "frame", "path", "sheet", "required_columns",
+                "min_rows", "seconds", "checked")
+
     def value(self):
-        result = {"action": self.action.currentText()}
+        # Start from the original step so fingerprint, detected_by, capture metadata and anything
+        # else the recorder attached survive an edit. Only the editable keys are overwritten.
+        result = json.loads(json.dumps(self.original)) if self.original else {}
+        for key in self.EDITABLE:
+            result.pop(key, None)
+        result["action"] = self.action.currentText()
         for key, field in self.fields.items():
             if field.isEnabled() and (field.text() or key == "value"):
                 result[key] = field.text() if key == "value" else field.text().strip()
@@ -151,7 +162,9 @@ class MainWindow(QMainWindow):
         self.mode = None
         self.artifact = ""
         self.last_result = None
-        self.captured = []
+        self.captured = []   # step ids in display order; a mirror, never the authority
+        self.mirror = {}     # step_id -> mirrored step
+        self.elements = []
         self.stop_deadline = None
         self.dead_since = None
         self.aux = []
@@ -173,7 +186,7 @@ class MainWindow(QMainWindow):
         sidebar.addSpacing(35)
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        self.nav.addItems(["Workflows", "Run history", "Settings"])
+        self.nav.addItems(["Workflows", "Element radar", "Run history", "Settings"])
         sidebar.addWidget(self.nav)
         sidebar.addWidget(label("DESKTOP CORE  /  0.1\nLocal storage · Windows", "tagline"))
         horizontal.addWidget(side)
@@ -181,6 +194,7 @@ class MainWindow(QMainWindow):
         self.stack.setObjectName("content")
         horizontal.addWidget(self.stack)
         self.build_workflows()
+        self.build_radar()
         self.build_history()
         self.build_settings()
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -280,6 +294,123 @@ class MainWindow(QMainWindow):
         self.log.setPlaceholderText("Run activity appears here. Your workflows and results stay on this PC.")
         layout.addWidget(self.log)
 
+    def build_radar(self):
+        layout = self.page("What can SmartOps see?", "Point at any element and read back every independent way it can be recognised.")
+        toolbar = QHBoxLayout()
+        self.radar_button = button("📡  Start radar", lambda: self.start_worker("inspect"), True)
+        self.radar_stop = button("■  Stop", self.stop_worker)
+        self.radar_stop.setObjectName("danger")
+        self.radar_stop.setEnabled(False)
+        toolbar.addWidget(self.radar_button)
+        toolbar.addWidget(self.radar_stop)
+        toolbar.addStretch()
+        toolbar.addWidget(button("Open fingerprint folder", self.open_radar_folder))
+        layout.addLayout(toolbar)
+        self.radar_status = label("Pick a Chrome tab on the Workflows page, then start the radar and click an element.")
+        layout.addWidget(self.radar_status)
+        split = QSplitter()
+        self.element_list = QListWidget()
+        self.element_list.setMinimumWidth(175)
+        self.element_list.currentRowChanged.connect(self.show_element)
+        split.addWidget(self.element_list)
+        right = QWidget()
+        card = QVBoxLayout(right)
+        card.setContentsMargins(14, 0, 0, 0)
+        self.radar_headline = label("No element pointed at yet.", "heading")
+        card.addWidget(self.radar_headline)
+        self.radar_table = QTableWidget(len(fp.LAYERS), 5)
+        self.radar_table.setHorizontalHeaderLabels(["Layer", "Sees it?", "Confidence", "What it sees", "Detector proven?"])
+        self.radar_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.radar_table.setColumnWidth(0, 150)
+        self.radar_table.setColumnWidth(1, 68)
+        self.radar_table.setColumnWidth(2, 80)
+        self.radar_table.setColumnWidth(4, 175)
+        self.radar_table.verticalHeader().hide()
+        self.radar_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.radar_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.radar_table.setAlternatingRowColors(True)
+        card.addWidget(self.radar_table, 1)
+        self.radar_image = QLabel()
+        self.radar_image.setFixedHeight(150)
+        self.radar_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.radar_image.setObjectName("card")
+        card.addWidget(self.radar_image)
+        self.radar_json = QTextEdit()
+        self.radar_json.setReadOnly(True)
+        self.radar_json.setMaximumHeight(140)
+        self.radar_json.setPlaceholderText("The full fingerprint appears here once you point at an element.")
+        card.addWidget(self.radar_json)
+        split.addWidget(right)
+        split.setSizes([175, 755])
+        layout.addWidget(split, 1)
+        self.render_radar(None)
+
+    def render_radar(self, fingerprint):
+        rows = fp.radar(fingerprint or {})
+        proof = {fp.VERIFIED: "verified in a real run", fp.IMPLEMENTED_UNVERIFIED: "code only, never proven", fp.NOT_IMPLEMENTED: "not implemented"}
+        for row, item in enumerate(rows):
+            values = [item["title"], item["icon"], f"{item['confidence']:.2f}" if item["status"] == fp.FOUND else "—",
+                      item["detail"] or item["purpose"], proof[item["maturity"]]]
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                if column in (1, 2):
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 4 and item["maturity"] != fp.VERIFIED:
+                    cell.setForeground(QColor("#a8701f"))
+                elif item["status"] != fp.FOUND:
+                    cell.setForeground(QColor("#8b98a8" if item["status"] == fp.UNAVAILABLE else "#b33e4d"))
+                self.radar_table.setItem(row, column, cell)
+        if not fingerprint:
+            self.radar_headline.setText("No element pointed at yet.")
+            self.radar_json.clear()
+            self.radar_image.clear()
+            self.radar_image.setText("No picture yet.")
+            return
+        self.radar_headline.setText(fp.score(fingerprint)["headline"])
+        self.radar_json.setPlainText(json.dumps(fingerprint, indent=2, ensure_ascii=False))
+        picture = (fingerprint["layers"]["visual"]["data"] or {}).get("context_png", "")
+        pixmap = QPixmap(picture) if picture and Path(picture).is_file() else QPixmap()
+        if pixmap.isNull():
+            self.radar_image.clear()
+            self.radar_image.setText("No picture for this element.")
+        else:
+            self.radar_image.setPixmap(pixmap.scaled(self.radar_image.width() or 600, 146, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def add_element(self, step_id):
+        """A pointed-at element appears at once; its evidence fills in when discovery lands."""
+        self.elements.append({"step_id": step_id, "fingerprint": None})
+        self.element_list.addItem(f"{len(self.elements)}. reading…")
+        self.element_list.setCurrentRow(len(self.elements) - 1)
+        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at")
+
+    def update_element(self, step_id, fingerprint):
+        for index, item in enumerate(self.elements):
+            if item["step_id"] != step_id:
+                continue
+            item["fingerprint"] = fingerprint
+            web = fingerprint["layers"]["web"]["data"] or {}
+            nexacro = fingerprint["layers"]["nexacro"]["data"] or {}
+            name = (nexacro.get("name") or nexacro.get("component") or web.get("accessible_name")
+                    or web.get("text") or web.get("id") or web.get("tag") or "element")
+            self.element_list.item(index).setText(f"{index + 1}. {name}"[:60])
+            if self.element_list.currentRow() == index:
+                self.render_radar(fingerprint)
+            summary = fp.score(fingerprint)
+            self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by "
+                                      f"{summary['identified']} layer(s), strongest {summary['best'] or 'none'} at {summary['best_confidence']:.2f}")
+            return
+
+    def show_element(self, index):
+        item = self.elements[index] if 0 <= index < len(self.elements) else None
+        self.render_radar(item["fingerprint"] if item else None)
+
+    def open_radar_folder(self):
+        path = self.store.root / "runs" / (self.run_id or "")
+        if not self.run_id or not path.is_dir():
+            self.notice("No fingerprints yet", "Start the radar and point at an element first.")
+            return
+        os.startfile(str(path))
+
     def build_history(self):
         layout = self.page("Every run, accounted for.", "Inspect outcomes, validation results and the local output folder.")
         self.history = QTableWidget(0, 4)
@@ -334,16 +465,8 @@ class MainWindow(QMainWindow):
     def select_workflow(self, index):
         if index < 0 or index >= len(self.items): return
         if self.current:
-            try:
-                self.current["name"] = self.name.text()
-                self.current["description"] = self.description.text()
-                self.store.save(self.current)
-                for i, value in enumerate(self.items):
-                    if value["id"] == self.current["id"]:
-                        self.items[i] = json.loads(json.dumps(self.current))
-                        self.workflow_list.item(i).setText(self.current["name"])
-            except ValueError:
-                pass
+            error = self.persist()
+            if error: self.notice("Edit not saved", error + "\n\nSwitching workflows discards that change.")
         self.current = json.loads(json.dumps(self.items[index]))
         self.name.setText(self.current["name"])
         self.description.setText(self.current.get("description", ""))
@@ -355,21 +478,27 @@ class MainWindow(QMainWindow):
             for col, value in enumerate([row+1, step["action"], step.get("label") or step.get("selector") or step.get("url") or step.get("path") or "—", "Ready"]):
                 self.steps.setItem(row, col, QTableWidgetItem(str(value)))
 
-    def save_current(self):
-        if not self.current: return False
+    def persist(self):
+        """Save pending name/description edits. Returns None, or the reason it could not be saved."""
+        if not self.current: return "No workflow is selected."
         try:
             self.current["name"] = self.name.text()
             self.current["description"] = self.description.text()
             self.current = self.store.save(self.current)
-            index = self.workflow_list.currentRow()
-            if index >= 0:
-                self.items[index] = json.loads(json.dumps(self.current))
-                self.workflow_list.item(index).setText(self.current["name"])
+            # Look the row up by ID: while switching workflows the selected row is already the new one.
+            for i, value in enumerate(self.items):
+                if value["id"] == self.current["id"]:
+                    self.items[i] = json.loads(json.dumps(self.current))
+                    self.workflow_list.item(i).setText(self.current["name"])
             self.status.setText("Saved locally.")
-            return True
+            return None
         except Exception as exc:
-            self.notice("Could not save", exc)
-            return False
+            return str(exc)
+
+    def save_current(self):
+        error = self.persist()
+        if error: self.notice("Could not save", error)
+        return error is None
 
     def new_workflow(self):
         name, ok = QInputDialog.getText(self, "New workflow", "Workflow name")
@@ -434,34 +563,37 @@ class MainWindow(QMainWindow):
             self.save_current()
 
     def set_busy(self, busy):
-        for item in [self.new_button, self.import_button, self.workflow_list, self.run_button, self.record_button, self.refresh_button, self.save_button, self.export_button, self.tabs, self.name, self.description, *self.edit_buttons]: item.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
+        for item in [self.new_button, self.import_button, self.workflow_list, self.run_button, self.record_button, self.refresh_button, self.save_button, self.export_button, self.tabs, self.name, self.description, self.radar_button, *self.edit_buttons]: item.setEnabled(not busy)
+        for item in [self.stop_button, self.radar_stop]: item.setEnabled(busy)
 
     def start_worker(self, mode):
         if self.process or not self.save_current(): return
-        page_url = self.tabs.currentData() or ""
-        needs_page = mode == "record" or (mode == "replay" and any(s["action"] not in {"demo_export", "validate_xlsx", "wait"} for s in self.current["steps"]))
-        if needs_page and not page_url:
-            self.notice("Choose Chrome tab", "Click Connect Chrome, then select the tab for this workflow. Connection instructions are in Settings.")
+        chosen = self.tabs.currentData() or {}
+        target_id, page_url = chosen.get("target_id", ""), chosen.get("url", "")
+        needs_page = mode in {"record", "inspect"} or (mode == "replay" and any(s.get("action") not in {"demo_export", "validate_xlsx", "wait", "secure_input"} for s in self.current["steps"]))
+        if needs_page and not target_id:
+            self.notice("Choose Chrome tab", "On the Workflows page click Connect Chrome, then choose the tab to work with. Connection details live under Settings.")
             return
-        if mode == "record":
-            answer = QMessageBox.question(self, "Record a new workflow", "Sign in before recording. Captured steps will be saved as a new workflow for review. Record only the actions you want to replay. Start recording?")
-            if answer != QMessageBox.StandardButton.Yes: return
         self.mode = mode
         self.captured = []
+        self.mirror = {}
         self.artifact = ""
         self.last_result = None
         self.dead_since = None
         self.stop_deadline = None
         self.log.clear()
         self.artifact_label.setText("No output file from this operation yet.")
-        self.run_id = self.store.start(self.current, "recording" if mode == "record" else "running") if mode != "tabs" else None
+        if mode == "inspect":
+            self.elements = []
+            self.element_list.clear()
+            self.render_radar(None)
+        self.run_id = self.store.start(self.current, {"record": "recording", "inspect": "inspecting"}.get(mode, "running")) if mode != "tabs" else None
         self.run_dir = self.store.root / "runs" / (self.run_id or "connection")
         try:
             context = mp.get_context("spawn")
             self.output = context.Queue()
             self.stop_event = context.Event()
-            self.process = context.Process(target=worker_main, args=(mode, self.current, self.store.settings(), str(self.run_dir), page_url, self.output, self.stop_event), daemon=True)
+            self.process = context.Process(target=worker_main, args=(mode, self.current, self.store.settings(), str(self.run_dir), page_url, self.output, self.stop_event, target_id), daemon=True)
             self.process.start()
         except Exception as exc:
             if self.run_id: self.store.finish(self.run_id, "failed", detail=str(exc))
@@ -472,7 +604,10 @@ class MainWindow(QMainWindow):
         self.set_busy(True)
         self.render_steps()
         self.progress.setRange(0, 0)
-        self.status.setText({"tabs": "Connecting to Google Chrome…", "record": "Recording · perform the task in your selected Chrome tab", "replay": "Running · automation is isolated from this window"}[mode])
+        self.status.setText({"tabs": "Connecting to Google Chrome…", "record": "Recording · work normally in the selected tab; frames and new tabs are followed",
+                             "inspect": "Radar armed · see the Element radar page", "replay": "Running · automation is isolated from this window"}[mode])
+        if mode == "inspect":
+            self.radar_status.setText("Radar armed · click any element in the selected Chrome tab. The click is captured, not passed to the page.")
 
     def stop_worker(self):
         if self.process:
@@ -505,13 +640,33 @@ class MainWindow(QMainWindow):
         kind = event["type"]
         if kind == "tab_updated":
             index = self.tabs.currentIndex()
-            if index >= 0:
-                self.tabs.setItemData(index, event["url"])
+            if index >= 0 and isinstance(self.tabs.itemData(index), dict):
+                # URL is display metadata; the target id keeps ownership across navigation.
+                self.tabs.setItemData(index, {**self.tabs.itemData(index), "url": event["url"]})
             return
-        if kind == "recorded":
-            self.captured.append(event["step"])
-            self.status.setText(f"Recording · {len(self.captured)} steps captured")
-            self.log.insertPlainText(f"Captured: {event['step']['action']}\n")
+        if kind == STEP_ADDED:
+            # Mirror only. The journal holds the authoritative timeline; this exists to show the
+            # user what is happening, and is never what a save reads from.
+            self.mirror[event["step_id"]] = dict(event["step"])
+            if event.get("stream") == RADAR_KIND:
+                self.add_element(event["step_id"])
+            else:
+                self.captured.append(event["step_id"])
+                self.status.setText(f"Recording · {len(self.captured)} steps captured")
+                self.log.insertPlainText(f"Captured: {event['step'].get('action', '?')}\n")
+            return
+        if kind == STEP_ENRICHED:
+            step = self.mirror.get(event["step_id"])
+            if step is not None:
+                step.update(event.get("patch") or {})
+            if event.get("stream") == RADAR_KIND and event.get("fingerprint"):
+                self.update_element(event["step_id"], event["fingerprint"])
+            return
+        if kind == CAPACITY:
+            # One authority owns the limit. The GUI reports its decision; it holds no limit of its own.
+            self.status.setText(event.get("message", "Recording capacity reached."))
+            return
+        if kind == SESSION_STATE:
             return
         if self.run_id: self.store.event(self.run_id, event)
         if event.get("message"): self.log.insertPlainText(event["message"] + "\n")
@@ -527,8 +682,10 @@ class MainWindow(QMainWindow):
             self.artifact_label.setText(("Validated Excel · " if kind == "validation" else "Saved file · ") + self.artifact)
         elif kind == "tabs":
             self.tabs.clear()
-            for tab in event["tabs"]: self.tabs.addItem(tab["title"] or tab["url"], tab["url"])
-            if not event["tabs"]: self.tabs.addItem("No http(s) tabs found", "")
+            self.tabs.addItem("Choose a Chrome tab" if event["tabs"] else "No http(s) tabs found", {})
+            for tab in event["tabs"]:
+                # Two tabs may show the same address; the target id is what tells them apart.
+                self.tabs.addItem(f"{tab['title']} — {tab['location']}"[:90], tab)
         elif kind == "done":
             self.last_result = event
 
@@ -548,10 +705,23 @@ class MainWindow(QMainWindow):
         if status in {"failed", "cancelled"}:
             for row in range(self.steps.rowCount()):
                 if self.steps.item(row, 3).text() == "Running": self.steps.item(row, 3).setText(status.capitalize())
-        if self.mode == "record" and self.captured:
-            flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download. Main-frame recording only.", "steps": self.captured})
-            self.current = None
-            self.reload_workflows(flow["id"])
+        if self.mode == "record":
+            if not self.captured:
+                self.status.setText("Recording stopped · nothing was captured, so no workflow was saved.")
+            else:
+                try:
+                    # The authoritative timeline, materialised from the journal on disk. Saving the
+                    # GUI's mirror would persist steps whose evidence never arrived.
+                    timeline = DraftJournal.timeline(self.run_dir)
+                    flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download.", "steps": timeline})
+                    # Only now, with the workflow really on disk, may the draft stop being offered
+                    # back. A failed save above leaves it recoverable, which is the point.
+                    RecordingSession.close_draft(self.run_dir, SAVED)
+                    self.current = None
+                    self.reload_workflows(flow["id"])
+                except Exception as exc:
+                    self.status.setText("Recording could not be saved · " + str(exc))
+                    self.notice("Recording not saved", exc)
         self.reload_history()
 
     def reload_history(self):
@@ -584,8 +754,9 @@ class MainWindow(QMainWindow):
         if not ok: return
         try:
             http_url(url)
-            helper = Path(self.store.settings()["chrome_launcher"])
-            if not helper.is_file(): raise ValueError("Approved Chrome launcher not found. Set its path in Settings.")
+            from .core import chrome_launcher
+            helper = chrome_launcher(self.store.settings())
+            if not helper.is_file(): raise ValueError("No approved Chrome helper was found. Point Settings at one, or place open_chrome.py beside SmartOps.")
             process = QProcess(self)
             if getattr(sys, "frozen", False):
                 process.setProgram(sys.executable)
@@ -604,7 +775,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.status.setText("Stopping worker. Close the window again after it finishes.")
             return
-        if not self.save_current():
+        error = self.persist()
+        if error and QMessageBox.question(self, "Close without saving?", "Your latest edit could not be saved: " + error + "\n\nClose SmartOps and discard that change?") != QMessageBox.StandardButton.Yes:
             event.ignore()
             return
         self.store.db.close()

@@ -1,0 +1,12 @@
+# risk ~ centrality x change frequency x weak proof x ownership uncertainty
+red_zones:
+  - {component: recording_session, path: smartops_desktop/session.py, why: "owns recording state, capacity, enrichment and the event contract; changed in every recent commit", proof: real-chromium}
+  - {component: gui, path: smartops_desktop/gui.py, why: "consumes the worker event contract; was the site of the recorded-vs-enriched break", proof: real-chromium}
+  - {component: discovery_manager, path: smartops_desktop/discovery.py, why: "owns ranking and detector isolation; every step depends on it", proof: real-chromium}
+  - {component: probe, path: smartops_desktop/probe.js, why: "runs inside untrusted pages; a mode mistake can swallow a real user click", proof: real-chromium}
+  - {component: workflow_schema, path: smartops_desktop/core.py, why: "any recorded field that it strips is silently lost at save time", proof: synthetic}
+known_gaps:
+  - {id: replay-does-not-consume-recorder-contract, severity: high, detail: "locators, frame_chain and page_context are recorded and persisted but replay reads only selector and frame."}
+  - {id: no-recovery-ui, severity: medium, detail: "unfinished drafts are detectable but nothing offers them to the user."}
+  - {id: stage-2-ux-not-started, severity: known, detail: "the recording journey still requires choosing a workflow, Connect Chrome and a tab first."}
+  - {id: windows-and-nexacro-unproven, severity: high, detail: "no real Windows and no real G-MES has ever been exercised."}

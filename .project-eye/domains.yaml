@@ -1,0 +1,21 @@
+# The five layers the map is built from: SYSTEM > DOMAIN > COMPONENT > CODE > RUNTIME.
+system: SmartOps Desktop
+domains:
+  capture:
+    purpose: Observe one real user interaction and turn it into evidence.
+    components: [probe, discovery_manager, fingerprint_contract, desktop_discovery, network_journal]
+  recording:
+    purpose: Own a target and turn interactions into a durable, recoverable timeline.
+    components: [recording_session, draft_journal, target_identity, worker_process]
+  persistence:
+    purpose: Validate and store workflows and run history.
+    components: [workflow_schema, store]
+  execution:
+    purpose: Replay a saved workflow and validate its output.
+    components: [replay]
+  presentation:
+    purpose: Show the user what is happening. Owns no recording truth.
+    components: [gui]
+  delivery:
+    purpose: Package and ship the Windows application.
+    components: [build]

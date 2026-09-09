@@ -1,0 +1,27 @@
+# capture / persist / review / replay / verify, per capability. VERIFIED always names its evidence.
+legend:
+  proof: [none, synthetic, real-chromium, real-windows, real-nexacro]
+capabilities:
+  ordinary_web_click:   {capture: yes, persist: yes, review: yes, replay: yes, proof: real-chromium}
+  text_input:           {capture: yes, persist: yes, review: yes, replay: yes, proof: real-chromium}
+  select:               {capture: yes, persist: yes, review: yes, replay: yes, proof: real-chromium}
+  checkbox:             {capture: yes, persist: yes, review: yes, replay: yes, proof: real-chromium}
+  special_keys:         {capture: yes, persist: yes, review: yes, replay: yes, proof: real-chromium}
+  iframe:               {capture: yes, persist: yes, review: yes, replay: partial, proof: real-chromium, note: replay uses the last frame hop only}
+  nested_iframe:        {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium, note: frame_chain recorded, never consumed}
+  popup_new_tab:        {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium, note: page_context recorded, never consumed}
+  spa_navigation:       {capture: yes, persist: yes, review: yes, replay: n/a, proof: real-chromium}
+  secure_input:         {capture: identity_only, persist: yes, review: yes, replay: refused_loudly, proof: real-chromium}
+  anchor:               {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium}
+  accessibility:        {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium}
+  visual:               {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium}
+  relative_position:    {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium}
+  network_context:      {capture: yes, persist: yes, review: yes, replay: no, proof: real-chromium}
+  nexacro:              {capture: yes, persist: yes, review: yes, replay: no, proof: synthetic, note: reproduction of the id shape only; never a live Nexacro runtime}
+  windows_uia:          {capture: yes, persist: yes, review: yes, replay: no, proof: synthetic, note: availability check exercised; query path never executed}
+  desktop_click:        {capture: yes, persist: yes, review: yes, replay: refused_loudly, proof: synthetic}
+  desktop_key:          {capture: yes, persist: yes, review: yes, replay: refused_loudly, proof: synthetic}
+  ocr:                  {capture: no, persist: no, review: no, replay: no, proof: none, note: adapter present, no engine bundled}
+  computer_vision:      {capture: no, persist: no, review: no, replay: no, proof: none, note: NOT_IMPLEMENTED by declaration}
+  download_and_excel:   {capture: n/a, persist: yes, review: yes, replay: yes, proof: synthetic}
+  windows_package:      {capture: n/a, persist: n/a, review: n/a, replay: n/a, proof: none, note: build.ps1 never executed; no Windows available}

@@ -1,0 +1,23 @@
+generated_from: d3568ecb35599de78372a87c9b1f4d533e29e590
+imports:
+  smartops_desktop/__init__.py: []
+  smartops_desktop/core.py: []
+  smartops_desktop/desktop_discovery.py: []
+  smartops_desktop/discovery.py:
+  - desktop_discovery
+  smartops_desktop/fingerprint.py: []
+  smartops_desktop/gui.py:
+  - core
+  - session
+  - worker
+  smartops_desktop/selftest.py:
+  - core
+  - gui
+  smartops_desktop/session.py:
+  - desktop_discovery
+  - discovery
+  smartops_desktop/targets.py: []
+  smartops_desktop/worker.py:
+  - core
+  - discovery
+  - session

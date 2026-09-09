@@ -1,0 +1,13 @@
+# Journey -> contract -> component -> test. A journey with no test fails validate.
+map:
+  RECORD-ACTION:   {contracts: [worker_event.step_added, recorded_step], tests: [tests/test_journeys.py, tests/test_session.py]}
+  ENRICH-ACTION:   {contracts: [worker_event.step_enriched, draft_operation], tests: [tests/test_journeys.py, tests/test_session.py]}
+  RADAR-ELEMENT:   {contracts: [worker_event.step_added, worker_event.step_enriched, element_fingerprint], tests: [tests/test_journeys.py, tests/test_radar.py]}
+  SAVE-RECORDING:  {contracts: [recorded_step, workflow], tests: [tests/test_journeys.py, tests/test_core.py]}
+  RECOVER-DRAFT:   {contracts: [draft_operation], tests: [tests/test_session.py]}
+  CONNECT-TARGET:  {contracts: [target_identity], tests: [tests/test_targets.py]}
+  POPUP-RECORDING: {contracts: [page_context], tests: [tests/test_session.py]}
+  NESTED-FRAME-RECORDING: {contracts: [recorded_step], tests: [tests/test_session.py]}
+  REPLAY-WORKFLOW: {contracts: [workflow], tests: [tests/test_core.py]}
+  DOWNLOAD-AND-VALIDATE: {contracts: [workflow], tests: [tests/test_core.py]}
+  DESKTOP-RECORDING: {contracts: [recorded_step], tests: [tests/test_session.py]}

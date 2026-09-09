@@ -1,0 +1,68 @@
+# A contract has a producer, consumers, and required fields. A consumer that reads a field its
+# producer does not emit is exactly the failure that broke recording; it is now checkable.
+contracts:
+  worker_event.step_added:
+    owner: recording_session
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/gui.py]
+    schema: {type: step_added, fields: [stream, index, step_id, step]}
+    forbidden_fields: [fingerprint]      # a freshly recorded step has no evidence yet
+    tests: [tests/test_journeys.py::test_every_worker_event_carries_exactly_the_fields_its_consumer_reads]
+  worker_event.step_enriched:
+    owner: recording_session
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/gui.py]
+    schema: {type: step_enriched, fields: [stream, step_id, patch, fingerprint]}
+    tests: [tests/test_journeys.py::test_the_gui_survives_a_step_added_event_that_has_no_fingerprint]
+  worker_event.capacity:
+    owner: recording_session
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/gui.py]
+    schema: {type: capacity, fields: [limit, message]}
+    tests: [tests/test_journeys.py::test_the_gui_holds_no_capacity_limit_of_its_own]
+  recorded_step:
+    owner: recording_session
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/core.py, smartops_desktop/gui.py]
+    schema: {fields: [step_id, action, label, captured, source, page_context, enriched, enrichment_status]}
+    enriched_fields: [selector, locators, primary_locator, fallback_locator, fingerprint, detected_by, best_layer, frame, frame_chain, frame_depth]
+    tests: [tests/test_journeys.py::test_a_save_takes_the_journal_timeline_not_the_gui_mirror]
+  element_fingerprint:
+    owner: fingerprint_contract
+    producer: smartops_desktop/fingerprint.py
+    consumers: [smartops_desktop/discovery.py, smartops_desktop/session.py, smartops_desktop/gui.py]
+    schema: {fields: [schema_version, captured, source, page_title, layers]}
+    tests: [tests/test_fingerprint.py]
+  locator_candidate:
+    owner: discovery_manager
+    producer: smartops_desktop/probe.js
+    consumers: [smartops_desktop/discovery.py]
+    schema: {fields: [kind, attribute, value]}
+    note: probe.js supplies facts only; kind/attribute/value. Scoring belongs to discovery.py.
+    tests: [tests/test_discovery.py::test_a_data_qa_attribute_is_never_written_out_as_data_testid]
+  page_context:
+    owner: recording_session
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/gui.py]
+    schema: {fields: [logical_page_id, relation, opener_page_id, captured_target_id, title]}
+    replay_consumer: NONE          # recorded but not yet used by replay
+    tests: [tests/test_session.py::test_a_step_records_which_logical_page_it_happened_on]
+  draft_operation:
+    owner: draft_journal
+    producer: smartops_desktop/session.py
+    consumers: [smartops_desktop/gui.py]
+    schema: {fields: [op, step_id, at]}
+    operations: [add, enrich, undo, edit]
+    tests: [tests/test_session.py::test_evidence_arrives_later_as_a_separate_operation_and_never_rewrites_the_step]
+  workflow:
+    owner: workflow_schema
+    producer: smartops_desktop/core.py
+    consumers: [smartops_desktop/gui.py, smartops_desktop/worker.py]
+    schema: {fields: [schema_version, id, name, description, steps]}
+    tests: [tests/test_core.py]
+  target_identity:
+    owner: target_identity
+    producer: smartops_desktop/targets.py
+    consumers: [smartops_desktop/session.py, smartops_desktop/worker.py, smartops_desktop/gui.py]
+    schema: {fields: [target_id, title, url, location]}
+    tests: [tests/test_targets.py]

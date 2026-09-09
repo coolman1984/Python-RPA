@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from . import targets
+from .discovery import DiscoveryManager
+from .session import RecordingSession
 from .core import cdp_url, http_url, validate_workflow, validate_xlsx, atomic_text
 
 
@@ -52,34 +55,36 @@ def safe_error(exc):
     return re.sub(r"https?://\S+", "[page]", first)[:500]
 
 
-def record(page, output, stop):
-    from playwright.sync_api import Error
-    script = Path(__file__).with_name("recorder.js").read_text(encoding="utf-8")
-    def capture(source, step):
-        if source["page"] != page or source["frame"] != page.main_frame or stop.is_set():
-            return
-        try:
-            cleaned = validate_workflow({"schema_version": 1, "name": "Capture", "steps": [step]})["steps"][0]
-            output.put({"type": "recorded", "step": cleaned})
-        except ValueError:
-            pass
-    page.expose_binding("__smartopsCapture", capture)
-    page.add_init_script(script)
-    page.evaluate(script)
-    parsed = urlsplit(page.url)
-    initial = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-    output.put({"type": "recorded", "step": {"action": "navigate", "url": initial, "label": "Open starting page (review URL parameters)"}})
-    output.put({"type": "log", "message": "Recording this tab's main frame. Sign in before recording. Password and sign-in fields are excluded. Review captured values before saving."})
-    try:
-        while not stop.is_set():
-            if page.is_closed():
-                raise RuntimeError("Recorded tab was closed. Captured steps remain available for review.")
-            page.wait_for_timeout(100)
-    finally:
-        try:
-            page.evaluate("window.__smartopsCapture = undefined")
-        except Error:
-            pass
+def open_session(browser, run_dir, output, mode, target_id="", page_url=""):
+    """One owner for the tab, from arming to review. Identity is the CDP target id, not the URL."""
+    session = RecordingSession(browser, run_dir, output, mode=mode)
+    session.prepare()
+    if not target_id:
+        # Older saved workflows only kept a URL. Resolve it once, then hold the target id.
+        matches = [t for t in targets.list_targets(browser) if t["url"] == page_url]
+        if len(matches) != 1:
+            raise ValueError("Choose one recording target. Two tabs showing the same page cannot be told apart by address; pick it from the list.")
+        target_id = matches[0]["target_id"]
+    session.choose(target_id)
+    session.arm()
+    return session
+
+
+def record(page_or_browser, output, stop, run_dir, target_id="", page_url=""):
+    """Attended recording across frames and popups, through the same discovery pipeline as the radar."""
+    session = open_session(page_or_browser, run_dir, output, "record", target_id, page_url)
+    output.put({"type": "log", "message": "Recording started on " + (targets.short_location(session.page.url) or "the selected tab")
+                + ". Frames and any new tabs it opens are followed automatically."})
+    session.run(stop)
+    return session
+
+
+def inspect(browser, run_dir, output, stop, target_id="", page_url=""):
+    """The element radar: the same probe and the same manager, pointing instead of recording."""
+    session = open_session(browser, run_dir, output, "radar", target_id, page_url)
+    output.put({"type": "log", "message": "Radar armed. Click any element in the selected tab; the click is captured, not passed to the page."})
+    session.run(stop)
+    return session
 
 
 def replay(workflow, settings, run_dir, output, stop, page=None):
@@ -119,6 +124,13 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
             last_file = candidate
             validated = True
             output.put({"type": "validation", "path": str(candidate), "result": result, "message": f"Validation passed: {result['rows']} data rows in {result['sheet']}."})
+        elif action in {"desktop_click", "desktop_press"}:
+            raise ValueError(f"Step {number+1} is a desktop interaction. SmartOps records these for "
+                             "review but does not replay desktop applications yet.")
+        elif action == "secure_input":
+            # Never claim a run passed when a human still has to type the secret.
+            raise ValueError(f"Step {number+1} needs a password or code typed by hand. "
+                             "Sign in manually first, then remove or replace this step; SmartOps will not type credentials.")
         elif page is None:
             raise ValueError("This action requires a connected Chrome tab.")
         elif action == "navigate":
@@ -161,25 +173,31 @@ def replay(workflow, settings, run_dir, output, stop, page=None):
     return {"artifact": str(last_file or ""), "validated": validated}
 
 
-def worker_main(mode, workflow, settings, run_dir, page_url, output, stop):
+def worker_main(mode, workflow, settings, run_dir, page_url, output, stop, target_id=""):
     try:
         if mode == "replay" and not workflow.get("steps"):
             raise ValueError("Add or record at least one step before running.")
-        browser_needed = mode in {"tabs", "record"} or any(s["action"] not in {"demo_export", "validate_xlsx", "wait"} for s in workflow.get("steps", []))
+        # secure_input is refused outright, so there is no point connecting to Chrome to say so.
+        offline_actions = {"demo_export", "validate_xlsx", "wait", "secure_input", "desktop_click", "desktop_press"}
+        browser_needed = mode in {"tabs", "record", "inspect"} or any(
+            s.get("action") not in offline_actions for s in workflow.get("steps", []))
         if browser_needed:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as playwright:
                 browser = connect(playwright, settings)
                 if mode == "tabs":
-                    output.put({"type": "tabs", "tabs": [{"title": p.title(), "url": p.url} for p in pages_for(browser)]})
+                    output.put({"type": "tabs", "tabs": targets.list_targets(browser)})
                     output.put({"type": "done", "status": "connected"})
                     return
-                page = select_page(browser, page_url)
                 if mode == "record":
-                    record(page, output, stop)
-                    output.put({"type": "tab_updated", "url": page.url})
+                    record(browser, output, stop, run_dir, target_id, page_url)
                     output.put({"type": "done", "status": "recorded"})
                     return
+                if mode == "inspect":
+                    inspect(browser, run_dir, output, stop, target_id, page_url)
+                    output.put({"type": "done", "status": "inspected"})
+                    return
+                page = targets.page_for_target(browser, target_id) if target_id else select_page(browser, page_url)
                 result = replay(workflow, settings, run_dir, output, stop, page)
                 output.put({"type": "tab_updated", "url": page.url})
                 # Leaving Playwright disconnects; never close the user's Chrome browser.
