@@ -91,16 +91,18 @@ def test_recording_nothing_does_not_claim_a_saved_workflow(tmp_path):
     window.close()
 
 
-def test_recording_stops_collecting_at_the_schema_limit(tmp_path):
+def test_the_gui_reports_the_sessions_capacity_decision_and_holds_none_of_its_own(tmp_path):
+    """Two independent limits meant the GUI could stop displaying at 1,000 while the journal kept
+    recording. Capacity has one owner now: the session."""
+    from smartops_desktop.session import CAPACITY, MAX_STEPS, RECORDING_KIND, STEP_ADDED
     window = window_with(tmp_path)
-    window.mode = "record"
-    window.captured = []
-    window.run_id = None
-    for _ in range(1005):
-        window.handle_event({"type": "recorded", "step": {"action": "click", "selector": "#a"}})
-    assert len(window.captured) == 1000
-    assert "limit reached" in window.status.text()
-    window.store.save({"schema_version": 1, "name": "Recording", "steps": window.captured})
+    for index in range(3):
+        window.handle_event({"type": STEP_ADDED, "stream": RECORDING_KIND, "index": index,
+                             "step_id": f"s{index:04d}", "step": {"action": "click", "label": "Save"}})
+    assert len(window.captured) == 3 and len(window.mirror) == 3
+    window.handle_event({"type": CAPACITY, "limit": MAX_STEPS,
+                         "message": f"Recording reached the {MAX_STEPS:,} step limit."})
+    assert "step limit" in window.status.text()
     window.close()
 
 
@@ -118,7 +120,8 @@ def sample_fingerprint():
 def test_radar_card_shows_one_row_per_layer_with_verdict_confidence_and_proof(tmp_path):
     from smartops_desktop import fingerprint as fp
     window = window_with(tmp_path)
-    window.add_element(sample_fingerprint())
+    window.add_element("s0001")
+    window.update_element("s0001", sample_fingerprint())
     assert window.radar_table.rowCount() == len(fp.LAYERS)
     rows = {window.radar_table.item(r, 0).text(): [window.radar_table.item(r, c).text() for c in range(5)]
             for r in range(window.radar_table.rowCount())}
@@ -138,8 +141,10 @@ def test_radar_card_shows_one_row_per_layer_with_verdict_confidence_and_proof(tm
 def test_radar_keeps_every_pointed_element_and_switches_between_them(tmp_path):
     from smartops_desktop import fingerprint as fp
     window = window_with(tmp_path)
-    window.add_element(sample_fingerprint())
-    window.add_element(fp.normalize({"layers": {"web": {"status": fp.FOUND, "detail": "field · id qty", "confidence": 0.95, "data": {"id": "qty"}}}}))
+    window.add_element("s0001")
+    window.update_element("s0001", sample_fingerprint())
+    window.add_element("s0002")
+    window.update_element("s0002", fp.normalize({"layers": {"web": {"status": fp.FOUND, "detail": "field · id qty", "confidence": 0.95, "data": {"id": "qty"}}}}))
     assert window.element_list.count() == 2
     window.element_list.setCurrentRow(0)
     assert window.radar_headline.text().startswith("4 of 12")

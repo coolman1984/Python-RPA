@@ -13,12 +13,13 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import tempfile
 import time
 from collections import deque
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 from uuid import uuid4
 
 from . import fingerprint as fp
@@ -50,9 +51,25 @@ class SessionError(RuntimeError):
 
 
 RECORDING_KIND, RADAR_KIND = "recording", "radar"
+
+# --- worker -> GUI event contract -----------------------------------------------------------
+# Every event name carries exactly ONE meaning, and no consumer may assume a field that has not
+# arrived yet. A step is announced when it is recorded; its evidence arrives as a separate,
+# separately-named event against the same step_id.
+STEP_ADDED = "step_added"        # {stream, index, step_id, step}      step has NO fingerprint yet
+STEP_ENRICHED = "step_enriched"  # {stream, step_id, patch, fingerprint}
+SESSION_STATE = "session_state"  # {state}
+CAPACITY = "capacity"            # {limit, message}
+EVENT_SCHEMA = {
+    STEP_ADDED: ("stream", "index", "step_id", "step"),
+    STEP_ENRICHED: ("stream", "step_id", "patch", "fingerprint"),
+    SESSION_STATE: ("state",),
+    CAPACITY: ("limit", "message"),
+}
 ENRICH_BACKLOG = 400      # bounded: a slow detector may never grow memory without limit
 ENRICH_PER_TICK = 3       # bounded: enrichment shares the loop, it never monopolises it
-MAX_STEPS = 1000          # one authority for capacity, matching the workflow schema
+MAX_STEPS = 1000          # THE authority for capacity. No other module may hold its own limit.
+PENDING, COMPLETE, ENRICH_FAILED, SKIPPED_CAPACITY = "pending", "complete", "failed", "skipped_capacity"
 
 
 class DraftJournal:
@@ -143,6 +160,18 @@ class DraftJournal:
         return [byid[step_id] for step_id in order if step_id in byid]
 
     @classmethod
+    def timeline(cls, folder):
+        """The authoritative recorded timeline, materialised from the log on disk.
+
+        This is what a save must use. A GUI copy assembled from live events is a mirror and may
+        have missed, reordered or never applied an enrichment; the log cannot.
+        """
+        reader = cls.__new__(cls)
+        reader.log_path = Path(folder) / "draft.jsonl"
+        reader.ADD, reader.ENRICH, reader.UNDO, reader.EDIT = cls.ADD, cls.ENRICH, cls.UNDO, cls.EDIT
+        return reader.steps()
+
+    @classmethod
     def unfinished(cls, root, kind=RECORDING_KIND):
         """Drafts a crash left behind, newest first. Radar diagnostics are never automations."""
         found = []
@@ -170,6 +199,7 @@ class RecordingSession:
         self.manager = manager or DiscoveryManager()
         self.mode = mode
         self.armed_mode = mode   # what 'resume' goes back to
+        self.stream = RECORDING_KIND if mode == "record" else RADAR_KIND
         self.state = IDLE
         self.target = {}
         self.page = None
@@ -198,7 +228,7 @@ class RecordingSession:
         self.state = state
         if self.journal:
             self.journal.note(state=state)
-        self.output.put({"type": "session", "state": state})
+        self.output.put({"type": SESSION_STATE, "state": state})
         return state
 
     # --- preparation ----------------------------------------------------------------------
@@ -303,47 +333,52 @@ class RecordingSession:
         self.native_start()
         return len(self.pages)
 
+    # A parameter whose NAME matches this never has its value written anywhere on disk.
+    SENSITIVE_PARAM = re.compile(r"token|session|sid|auth|secret|key|otp|code|ticket|pass|pwd|credential|bearer|jwt|signature|sig", re.I)
+
+    @classmethod
+    def classify_start_url(cls, raw):
+        """Four separate things, so a routing parameter is never confused with a credential.
+
+        display        what a person is shown
+        persisted      what goes into the draft and the saved workflow
+        routing        parameter values the screen genuinely needs, minus anything secret-looking
+        sensitive      names only — their values are dropped and never written down
+        """
+        parsed = urlsplit(raw or "")
+        display = urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, "", ""))
+        routing, sensitive = {}, []
+        for name, values in parse_qs(parsed.query, keep_blank_values=True).items():
+            if cls.SENSITIVE_PARAM.search(name):
+                sensitive.append(name)
+            else:
+                routing[name] = values[0][:200]
+        return {"display": display, "persisted": display, "routing": routing,
+                "sensitive": sorted(sensitive), "had_fragment": bool(parsed.fragment),
+                "requires_review": bool(routing or sensitive or parsed.fragment)}
+
     def start_context(self):
         """The starting page is step one. It goes through the journal like every other step, so a
         recovered draft always knows where the automation begins."""
-        parsed = urlsplit(self.page.url)
-        # A17: the query string is kept locally, because some enterprise screens cannot be reached
-        # without it, but it is flagged for review and never part of the display or export URL.
-        safe = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        policy = self.classify_start_url(self.page.url)
         self.count += 1
         step_id = f"s{self.count:04d}"
-        step = {"step_id": step_id, "action": "navigate", "url": safe, "start_url": self.page.url,
-                "requires_review": bool(parsed.query or parsed.fragment),
-                "label": "Open starting page" + (" (its address carries parameters — review before sharing)" if parsed.query else ""),
+        note = ""
+        if policy["sensitive"]:
+            note = " · a credential-like parameter was removed: " + ", ".join(policy["sensitive"])
+        elif policy["routing"]:
+            note = " · its address carries parameters, review before sharing"
+        step = {"step_id": step_id, "action": "navigate", "url": policy["persisted"],
+                "start_routing": policy["routing"], "removed_parameters": policy["sensitive"],
+                "requires_review": policy["requires_review"],
+                "label": "Open starting page" + note,
                 "captured": fp.now(), "origin": "start_context", "enriched": True,
-                "page_context": self.page_context(None)}
+                "enrichment_status": COMPLETE, "page_context": self.page_context(None)}
         if self.journal:
             self.journal.add(step_id, step)
-        self.output.put({"type": "recorded", "index": self.count, "step_id": step_id, "step": step})
+        self.output.put({"type": STEP_ADDED, "stream": self.stream, "index": self.count,
+                         "step_id": step_id, "step": step})
         return step
-
-    @staticmethod
-    def close_draft(run_dir, state=SAVED):
-        """Close a draft from whichever process owns the database.
-
-        The worker owns recording; the GUI owns the Store. The worker is gone by the time a
-        workflow is persisted, so only the parent can honestly say a draft is finished — and only
-        after Store.save() actually returned.
-        """
-        header_path = Path(run_dir) / "draft.json"
-        if not header_path.is_file():
-            return False
-        try:
-            header = json.loads(header_path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        header["state"] = state
-        header["closed"] = fp.now()
-        handle, temporary = tempfile.mkstemp(prefix=".draft-", dir=str(header_path.parent))
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(header, stream, ensure_ascii=False, indent=2)
-        os.replace(temporary, header_path)
-        return True
 
     def finalize(self, state=SAVED):
         """Close the draft only once the workflow really is on disk. A failed save keeps it open."""
@@ -446,7 +481,7 @@ class RecordingSession:
             if self.count >= MAX_STEPS:
                 if not self.at_capacity:
                     self.at_capacity = True
-                    self.output.put({"type": "capacity", "limit": MAX_STEPS,
+                    self.output.put({"type": CAPACITY, "limit": MAX_STEPS,
                                      "message": f"Recording reached the {MAX_STEPS:,} step limit. Stop to keep what was captured."})
                 continue
             self.count += 1
@@ -454,10 +489,18 @@ class RecordingSession:
             step = self.raw_step(step_id, payload, queued)
             if self.journal:
                 self.journal.add(step_id, step)
-            self.output.put({"type": "element" if payload.get("kind") == "point" else "recorded",
-                             "index": self.count, "step_id": step_id, "step": step})
+            self.output.put({"type": STEP_ADDED, "stream": self.stream, "index": self.count,
+                             "step_id": step_id, "step": step})
             if len(self.enrich_backlog) == self.enrich_backlog.maxlen:
-                self.skipped_enrichment += 1   # the action is safe; only its evidence is dropped
+                # The action itself is safe on disk. Its evidence is not going to be gathered, and
+                # that must be stated on the step rather than surfacing later as "selector required".
+                dropped = self.enrich_backlog[0]
+                self.skipped_enrichment += 1
+                if self.journal:
+                    self.journal.enrich(dropped["step_id"], {"enrichment_status": SKIPPED_CAPACITY,
+                                                             "enrichment_reason": "the enrichment backlog was full"})
+                self.output.put({"type": STEP_ENRICHED, "stream": self.stream, "step_id": dropped["step_id"],
+                                 "patch": {"enrichment_status": SKIPPED_CAPACITY}, "fingerprint": None})
             self.enrich_backlog.append({"step_id": step_id, "payload": payload, "frame": frame})
             produced.append(step)
         return produced
@@ -482,8 +525,8 @@ class RecordingSession:
             patch = self.evidence_patch(result)
             if self.journal:
                 self.journal.enrich(item["step_id"], patch)
-            self.output.put({"type": "enriched", "step_id": item["step_id"], "patch": patch,
-                             "fingerprint": result})
+            self.output.put({"type": STEP_ENRICHED, "stream": self.stream, "step_id": item["step_id"],
+                             "patch": patch, "fingerprint": result})
             done.append(item["step_id"])
         return done
 
@@ -497,7 +540,7 @@ class RecordingSession:
                 "captured": fp.now(), "received": queued.get("received"),
                 "source": "desktop" if queued.get("native") else "browser",
                 "page_context": self.page_context(queued.get("frame")),
-                "enriched": False}
+                "enriched": False, "enrichment_status": PENDING}
         for key in ("value", "checked", "secure"):
             if key in payload:
                 step[key] = payload[key]
@@ -513,7 +556,7 @@ class RecordingSession:
         """Everything discovery adds to a step once it has run."""
         ranked = rank_locators(result)
         best = fp.rank(result)
-        patch = {"fingerprint": result, "enriched": True,
+        patch = {"fingerprint": result, "enriched": True, "enrichment_status": COMPLETE,
                  "locators": ranked, "detected_by": [key for key, _ in best],
                  "best_layer": best[0][0] if best else ""}
         if ranked:

@@ -1,0 +1,11 @@
+processes:
+  gui:    {module: smartops_desktop/gui.py, owns_db: true,  spawns: worker}
+  worker: {module: smartops_desktop/worker.py, owns_db: false, spawned_via: multiprocessing spawn}
+external:
+  chrome: {protocol: CDP, endpoint: loopback only, guard: smartops_desktop/worker.py::connect}
+  windows_input: {module: smartops_desktop/desktop_discovery.py, available_on: win32 only}
+artifacts:
+  draft_header: runs/<run-id>/draft.json
+  draft_log:    runs/<run-id>/draft.jsonl
+  element_png:  runs/<run-id>/element-N.png
+  database:     smartops.sqlite3

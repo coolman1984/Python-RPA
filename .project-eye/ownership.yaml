@@ -1,0 +1,28 @@
+# Exactly one owner per piece of critical state. A second authority is an OWNERSHIP CONFLICT.
+components:
+  probe:              {path: smartops_desktop/probe.js,             owns: [page_side_facts]}
+  fingerprint_contract: {path: smartops_desktop/fingerprint.py,     owns: [layer_set, status_vocabulary, maturity_vocabulary, ranking_rules]}
+  discovery_manager:  {path: smartops_desktop/discovery.py,         owns: [detector_isolation, locator_judgement, confidence_policy]}
+  desktop_discovery:  {path: smartops_desktop/desktop_discovery.py, owns: [raw_native_input, windows_uia_probe]}
+  network_journal:    {path: smartops_desktop/discovery.py,         owns: [network_context]}
+  recording_session:  {path: smartops_desktop/session.py,           owns: [recording_state, page_ownership, draft_lifecycle, capacity, enrichment_scheduling, worker_event_contract]}
+  draft_journal:      {path: smartops_desktop/session.py,           owns: [recorded_timeline]}
+  target_identity:    {path: smartops_desktop/targets.py,           owns: [browser_target_identity]}
+  worker_process:     {path: smartops_desktop/worker.py,            owns: [process_orchestration]}
+  workflow_schema:    {path: smartops_desktop/core.py,              owns: [workflow_validation, action_set]}
+  store:              {path: smartops_desktop/core.py,              owns: [persisted_workflows, run_history, settings]}
+  replay:             {path: smartops_desktop/worker.py,            owns: [step_execution]}
+  gui:                {path: smartops_desktop/gui.py,               owns: [presentation]}
+  build:              {path: build.ps1,                             owns: [packaging]}
+
+state:
+  recording_state:      recording_session
+  page_ownership:       recording_session
+  browser_target_identity: target_identity
+  recorded_timeline:    draft_journal          # NOT the GUI. The GUI mirrors it.
+  capacity:             recording_session      # NOT the GUI.
+  layer_set:            fingerprint_contract
+  confidence_policy:    discovery_manager      # NOT probe.js.
+  workflow_validation:  workflow_schema
+  persisted_workflows:  store
+  page_side_facts:      probe

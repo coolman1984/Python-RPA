@@ -1,0 +1,36 @@
+# INTENDED vs STATIC ACTUAL vs RUNTIME PROVEN. Where they differ, the difference is recorded,
+# never edited away.
+stage: "1.5 — recording kernel repaired; Stage 2 UX not started"
+drift:
+  - id: replay-behind-recorder
+    intended: A recorded step's ranked locators, frame chain and page context guide replay.
+    static_actual: All three are captured, persisted and survive a save/reload round trip.
+    runtime_proven: replay reads only `selector` and a single `frame`.
+    severity: high
+    owner: replay
+    affected_journeys: [REPLAY-WORKFLOW, NESTED-FRAME-RECORDING, POPUP-RECORDING]
+    decision: Recorded is not replayable. Left as a declared gap; not repaired in this task.
+  - id: recovery-contract-without-a-screen
+    intended: An unfinished recording is offered back after a crash.
+    static_actual: DraftJournal.unfinished and DraftJournal.timeline both work and are tested.
+    runtime_proven: nothing in the GUI ever calls them.
+    severity: medium
+    owner: gui
+    affected_journeys: [RECOVER-DRAFT]
+    decision: Stage 2.
+  - id: ux-is-still-the-old-journey
+    intended: Open SmartOps -> Record New Automation -> pick target -> work -> Stop -> name and save.
+    static_actual: The user must pick a workflow, open Connect Chrome and choose a tab first.
+    runtime_proven: same.
+    severity: known
+    owner: gui
+    decision: Deliberately untouched. Stage 2.
+runtime_boundary:
+  parent_gui_process:
+    writes: [smartops.sqlite3, workflows/*.json, settings.yaml, draft.json state on save]
+    must_not_write: [draft.jsonl]
+  child_worker_process:
+    writes: [draft.json, draft.jsonl, element PNGs, run artifacts]
+    must_not_write: [smartops.sqlite3]
+  chrome_cdp: {owned_by: recording_session, note: attached over a loopback endpoint only}
+  windows_native_hooks: {owned_by: desktop_discovery, note: declines to start off Windows}

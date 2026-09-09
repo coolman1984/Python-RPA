@@ -1,5 +1,9 @@
 # Project map — Universal Discovery & Recording Layer
 
+> **This page is checked against the code.** `tools/project_eye.py validate` compares the layer
+> count, the Vision maturity and the locator scores below with what the modules actually declare,
+> and fails when they drift. Three facts here had already gone stale before that check existed.
+
 > Reconciled on `fix/recorder-ux-session` from three diverging architectures. The contract and the
 > manager come from `claude/improve-code-first-s2uqdb`; the recording coverage, the Windows probe,
 > the network journal and the locator-based visual capture come from
@@ -45,7 +49,7 @@ it, where its output goes, and how far each one has actually been proven.
               │
               ├─────────────► draft journal (append-safe, survives a crash):
               │                 runs/<run-id>/draft.json    session, target, state, count
-              │                 runs/<run-id>/draft.jsonl   one recorded step per line
+              │                 runs/<run-id>/draft.jsonl   append-only operations: add/enrich/undo/edit
               │                 runs/<run-id>/element-N.png, element-N-context.png
               │
               └─► output queue  {"type": "element", ...}
@@ -72,7 +76,7 @@ never lets one detector's failure reach another, or the recording.
 | 8 | relative | `RelativeDetector` | probe.js `relativeLayer` | `layers.relative` | VERIFIED |
 | 9 | keyboard | `KeyboardDetector` | probe.js `keyboardLayer` | `layers.keyboard` | VERIFIED |
 | 10 | ocr | `OcrDetector` | `pytesseract` + the visual layer's PNG | `layers.ocr` | IMPLEMENTED_UNVERIFIED |
-| 11 | vision | `VisionDetector` | `opencv-python` + the visual layer's PNG | `layers.vision` | IMPLEMENTED_UNVERIFIED |
+| 11 | vision | `VisionDetector` | none — reserved slot | `layers.vision` | NOT_IMPLEMENTED |
 | 12 | network | `NetworkDetector` | `NetworkJournal` (ported from v2) | `layers.network` (context, never ranked) | VERIFIED |
 
 Detector order is declared once, in `fingerprint.LAYERS`. `discovery.DEFAULT_DETECTORS`
@@ -111,7 +115,7 @@ testable without a browser — `probe.js` gathers evidence and never scores it.
 | --- | --- | --- |
 | stable unique id | 0.95 | survives layout and content changes |
 | id that looks generated (`ctl00_x_1739284`) | 0.72 | rebuilt per session or per build |
-| `data-testid` | 0.93 | put there to be depended on |
+| a test id (`data-testid`, `data-test`, `data-qa`, `data-cy`) | 0.96 | put there to be depended on |
 | unique `name` | 0.88 | stable, but shared across forms more often than ids |
 | unique non-positional selector | 0.80 | attribute-based |
 | positional selector (`div:nth-of-type(3) > button`) | 0.62 | breaks when a row is inserted |

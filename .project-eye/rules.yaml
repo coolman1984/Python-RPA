@@ -1,0 +1,86 @@
+rules:
+- id: probe-no-confidence
+  statement: probe.js gathers facts; it must not hold confidence or ranking policy.
+  check: forbid_pattern
+  path: smartops_desktop/probe.js
+  pattern: confidence
+  severity: error
+- id: probe-default-off
+  statement: The page probe must default to 'off', never 'radar', or a new frame swallows a real click.
+  check: require_pattern
+  path: smartops_desktop/probe.js
+  pattern: __smartopsProbeMode \|\| 'off'
+  severity: error
+- id: fingerprint-pure
+  statement: fingerprint.py is a pure data contract; no GUI, Playwright or filesystem dependency.
+  check: forbid_import
+  path: smartops_desktop/fingerprint.py
+  imports:
+  - PySide6
+  - playwright
+  - sqlite3
+  - os
+  severity: error
+- id: gui-not-timeline-authority
+  statement: The GUI must save the journal's materialised timeline, never its own mirror.
+  check: require_pattern
+  path: smartops_desktop/gui.py
+  pattern: DraftJournal.timeline
+  severity: error
+- id: gui-no-capacity-limit
+  statement: Capacity has one owner. The GUI must not compare against its own step limit.
+  check: forbid_pattern
+  path: smartops_desktop/gui.py
+  pattern: captured\) >= 1000
+  severity: error
+- id: gui-no-discovery
+  statement: The GUI must contain no discovery business logic.
+  check: forbid_import
+  path: smartops_desktop/gui.py
+  imports:
+  - playwright
+  severity: error
+- id: worker-not-db-owner
+  statement: The worker process must never open the GUI's database.
+  check: forbid_pattern
+  path: smartops_desktop/worker.py
+  pattern: Store\(
+  severity: error
+- id: no-machine-specific-path
+  statement: No developer's absolute machine path may ship in source.
+  check: forbid_pattern_tree
+  pattern: '[A-Z]:\\(WORK|Users|Program|Dev)'
+  severity: error
+- id: unsupported-replay-fails-loudly
+  statement: An action replay cannot perform must raise, never silently pass.
+  check: require_pattern
+  path: smartops_desktop/worker.py
+  pattern: does not replay desktop applications yet
+  severity: error
+- id: radar-not-an-automation
+  statement: A radar session must never be offered back as an unfinished automation.
+  check: require_pattern
+  path: smartops_desktop/session.py
+  pattern: kind=RECORDING_KIND if self.armed_mode
+  severity: error
+- id: doc-layer-count
+  statement: PROJECT-MAP.md must state the real number of discovery layers.
+  check: doc_fact
+  path: PROJECT-MAP.md
+  fact: layer_count
+  pattern: \| (\d+) \| network \|
+  severity: error
+- id: doc-vision-maturity
+  statement: PROJECT-MAP.md must state Vision's real maturity.
+  check: doc_fact
+  path: PROJECT-MAP.md
+  fact: vision_maturity
+  pattern: \| `layers.vision` \| (\w+) \|
+  severity: error
+- id: doc-testid-confidence
+  statement: PROJECT-MAP.md must state the real test-id confidence.
+  check: doc_fact
+  path: PROJECT-MAP.md
+  fact: testid_confidence
+  pattern: data-cy`\) \| ([\d.]+) \|
+  severity: error

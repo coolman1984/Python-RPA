@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
 
 from . import fingerprint as fp
 from .core import Store, ACTIONS, validate_workflow, atomic_text, http_url
-from .session import SAVED, DISCARDED, RecordingSession
+from .session import (CAPACITY, DISCARDED, RADAR_KIND, SAVED, SESSION_STATE, STEP_ADDED,
+                      STEP_ENRICHED, DraftJournal, RecordingSession)
 from .worker import worker_main
 
 STYLE = """
@@ -161,7 +162,8 @@ class MainWindow(QMainWindow):
         self.mode = None
         self.artifact = ""
         self.last_result = None
-        self.captured = []
+        self.captured = []   # step ids in display order; a mirror, never the authority
+        self.mirror = {}     # step_id -> mirrored step
         self.elements = []
         self.stop_deadline = None
         self.dead_since = None
@@ -374,19 +376,33 @@ class MainWindow(QMainWindow):
         else:
             self.radar_image.setPixmap(pixmap.scaled(self.radar_image.width() or 600, 146, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
-    def add_element(self, fingerprint):
-        self.elements.append(fingerprint)
-        web = fingerprint["layers"]["web"]["data"] or {}
-        nexacro = fingerprint["layers"]["nexacro"]["data"] or {}
-        name = nexacro.get("name") or nexacro.get("component") or web.get("text") or web.get("id") or web.get("tag") or "element"
-        self.element_list.addItem(f"{len(self.elements)}. {name}"[:60])
+    def add_element(self, step_id):
+        """A pointed-at element appears at once; its evidence fills in when discovery lands."""
+        self.elements.append({"step_id": step_id, "fingerprint": None})
+        self.element_list.addItem(f"{len(self.elements)}. reading…")
         self.element_list.setCurrentRow(len(self.elements) - 1)
-        summary = fp.score(fingerprint)
-        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by "
-                                  f"{summary['identified']} layer(s), strongest {summary['best'] or 'none'} at {summary['best_confidence']:.2f}")
+        self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at")
+
+    def update_element(self, step_id, fingerprint):
+        for index, item in enumerate(self.elements):
+            if item["step_id"] != step_id:
+                continue
+            item["fingerprint"] = fingerprint
+            web = fingerprint["layers"]["web"]["data"] or {}
+            nexacro = fingerprint["layers"]["nexacro"]["data"] or {}
+            name = (nexacro.get("name") or nexacro.get("component") or web.get("accessible_name")
+                    or web.get("text") or web.get("id") or web.get("tag") or "element")
+            self.element_list.item(index).setText(f"{index + 1}. {name}"[:60])
+            if self.element_list.currentRow() == index:
+                self.render_radar(fingerprint)
+            summary = fp.score(fingerprint)
+            self.radar_status.setText(f"Radar armed · {len(self.elements)} element(s) pointed at · last one recognised by "
+                                      f"{summary['identified']} layer(s), strongest {summary['best'] or 'none'} at {summary['best_confidence']:.2f}")
+            return
 
     def show_element(self, index):
-        self.render_radar(self.elements[index] if 0 <= index < len(self.elements) else None)
+        item = self.elements[index] if 0 <= index < len(self.elements) else None
+        self.render_radar(item["fingerprint"] if item else None)
 
     def open_radar_folder(self):
         path = self.store.root / "runs" / (self.run_id or "")
@@ -560,6 +576,7 @@ class MainWindow(QMainWindow):
             return
         self.mode = mode
         self.captured = []
+        self.mirror = {}
         self.artifact = ""
         self.last_result = None
         self.dead_since = None
@@ -627,17 +644,29 @@ class MainWindow(QMainWindow):
                 # URL is display metadata; the target id keeps ownership across navigation.
                 self.tabs.setItemData(index, {**self.tabs.itemData(index), "url": event["url"]})
             return
-        if kind == "element":
-            if self.run_id: self.store.event(self.run_id, {"type": "element", "index": event["index"]})
-            self.add_element(event["fingerprint"])
+        if kind == STEP_ADDED:
+            # Mirror only. The journal holds the authoritative timeline; this exists to show the
+            # user what is happening, and is never what a save reads from.
+            self.mirror[event["step_id"]] = dict(event["step"])
+            if event.get("stream") == RADAR_KIND:
+                self.add_element(event["step_id"])
+            else:
+                self.captured.append(event["step_id"])
+                self.status.setText(f"Recording · {len(self.captured)} steps captured")
+                self.log.insertPlainText(f"Captured: {event['step'].get('action', '?')}\n")
             return
-        if kind == "recorded":
-            if len(self.captured) >= 1000:
-                self.status.setText("Recording · 1,000 step limit reached. Click Stop to keep what was captured.")
-                return
-            self.captured.append(event["step"])
-            self.status.setText(f"Recording · {len(self.captured)} steps captured")
-            self.log.insertPlainText(f"Captured: {event['step']['action']}\n")
+        if kind == STEP_ENRICHED:
+            step = self.mirror.get(event["step_id"])
+            if step is not None:
+                step.update(event.get("patch") or {})
+            if event.get("stream") == RADAR_KIND and event.get("fingerprint"):
+                self.update_element(event["step_id"], event["fingerprint"])
+            return
+        if kind == CAPACITY:
+            # One authority owns the limit. The GUI reports its decision; it holds no limit of its own.
+            self.status.setText(event.get("message", "Recording capacity reached."))
+            return
+        if kind == SESSION_STATE:
             return
         if self.run_id: self.store.event(self.run_id, event)
         if event.get("message"): self.log.insertPlainText(event["message"] + "\n")
@@ -681,7 +710,10 @@ class MainWindow(QMainWindow):
                 self.status.setText("Recording stopped · nothing was captured, so no workflow was saved.")
             else:
                 try:
-                    flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download.", "steps": self.captured})
+                    # The authoritative timeline, materialised from the journal on disk. Saving the
+                    # GUI's mirror would persist steps whose evidence never arrived.
+                    timeline = DraftJournal.timeline(self.run_dir)
+                    flow = self.store.save({"schema_version": 1, "name": self.current["name"] + " · recording", "description": "Review starting URL, captured values and selectors. Convert the export click to Download.", "steps": timeline})
                     # Only now, with the workflow really on disk, may the draft stop being offered
                     # back. A failed save above leaves it recoverable, which is the point.
                     RecordingSession.close_draft(self.run_dir, SAVED)
